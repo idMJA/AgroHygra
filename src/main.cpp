@@ -6,10 +6,14 @@
 #include "DHT.h"
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
+#include <Preferences.h>
 
 // ========== KONFIGURASI WIFI ==========
-const char *ssid = "MJLANA";       // Ganti dengan nama WiFi Anda
-const char *password = "lihatjam"; // Ganti dengan password WiFi Anda
+// WiFi credentials will be stored in Preferences (non-volatile storage)
+// User can configure via web portal when in AP mode
+String savedSSID = "";
+String savedPassword = "";
+Preferences preferences;
 
 // ========== KONFIGURASI MQTT ==========
 // Public MQTT broker for testing (no authentication required)
@@ -49,6 +53,7 @@ const char *TOPIC_LOGS = "agrohygra/logs";
 // Use ADC1 pins to avoid WiFi conflicts. For digital pin, use any available GPIO.
 #define MQ135_AO_PIN 35 // Pin analog untuk MQ-135 AO (air quality analog output)
 #define MQ135_DO_PIN 32 // Pin digital untuk MQ-135 DO (digital threshold output) - optional
+#define TDS_PIN 33      // Pin analog untuk TDS meter (A -> this pin). Use ADC1 pin (32-39) to avoid WiFi conflicts
 // Relay wiring: VCC, GND, IN. Relay module output pins: COM (common), NO (normally open), NC (normally closed).
 // For a pump, wire the pump's power supply through COM -> NO (pump powered when relay ON) for normally-open behavior.
 // Many 1-channel relay modules are active-low for the IN pin (drive LOW to activate). If unsure, test carefully.
@@ -96,6 +101,10 @@ int airQuality = 0;         // MQ-135 air quality (0-100 scale, lower is better)
 int airQualityRaw = 0;      // Raw ADC reading from MQ-135
 bool airQualityGood = true; // Digital threshold status from DO pin
 
+// TDS sensor
+int tdsRaw = 0;   // raw ADC reading from TDS A pin
+int tdsValue = 0; // estimated TDS (ppm) - requires calibration
+
 // Statistik sistem
 unsigned long totalWateringTime = 0;
 int wateringCount = 0;
@@ -106,6 +115,73 @@ unsigned long lastMqttSensorPublish = 0;
 const unsigned long MQTT_SENSOR_INTERVAL = 2000; // Publish sensor data every 2 seconds
 unsigned long lastMqttReconnect = 0;
 const unsigned long MQTT_RECONNECT_INTERVAL = 5000; // Try reconnect every 5 seconds
+
+// WiFi Manager variables
+bool isAPMode = false;
+String scannedNetworks = "";
+
+// ========== FUNGSI WIFI MANAGER ==========
+void saveWiFiCredentials(String ssid, String password)
+{
+  preferences.begin("wifi", false);
+  preferences.putString("ssid", ssid);
+  preferences.putString("password", password);
+  preferences.end();
+  Serial.println("✅ WiFi credentials saved to flash");
+}
+
+void loadWiFiCredentials()
+{
+  preferences.begin("wifi", true);
+  savedSSID = preferences.getString("ssid", "");
+  savedPassword = preferences.getString("password", "");
+  preferences.end();
+
+  if (savedSSID.length() > 0)
+  {
+    Serial.println("📡 Loaded WiFi credentials from flash:");
+    Serial.println("   SSID: " + savedSSID);
+  }
+  else
+  {
+    Serial.println("⚠️  No saved WiFi credentials found");
+  }
+}
+
+void clearWiFiCredentials()
+{
+  preferences.begin("wifi", false);
+  preferences.clear();
+  preferences.end();
+  savedSSID = "";
+  savedPassword = "";
+  Serial.println("🗑️  WiFi credentials cleared");
+}
+
+String scanWiFiNetworks()
+{
+  Serial.println("🔍 Scanning WiFi networks...");
+  int n = WiFi.scanNetworks();
+  String networks = "";
+
+  if (n == 0)
+  {
+    networks = "No networks found";
+  }
+  else
+  {
+    Serial.printf("Found %d networks\n", n);
+    for (int i = 0; i < n; ++i)
+    {
+      networks += "<option value=\"" + WiFi.SSID(i) + "\">";
+      networks += WiFi.SSID(i);
+      networks += " (" + String(WiFi.RSSI(i)) + " dBm)";
+      networks += (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? " [Open]" : " [Secured]";
+      networks += "</option>";
+    }
+  }
+  return networks;
+}
 
 // ========== FUNGSI SENSOR ==========
 int readSoilMoisture()
@@ -171,6 +247,27 @@ void readAllSensors()
   soilMoisture = readSoilMoisture();
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
+
+  // Read TDS sensor
+  {
+    const int samples = 10;
+    long sum = 0;
+    for (int i = 0; i < samples; i++)
+    {
+      sum += analogRead(TDS_PIN);
+      delay(10);
+    }
+    tdsRaw = sum / samples;
+    // Convert raw ADC to voltage (12-bit ADC, reference 3.3V)
+    float voltage = (tdsRaw / 4095.0) * 3.3;
+    // Simple heuristic conversion to TDS (ppm) - module-specific and needs calibration
+    // Many TDS probes/modules output a voltage roughly proportional to conductivity.
+    // Use a calibration multiplier; default 500 is a rough starting point.
+    const float TDS_K = 500.0;
+    tdsValue = (int)(voltage * TDS_K);
+  }
+  // Print TDS to serial
+  Serial.printf("📡 TDS: %d ppm (raw: %d)\n", tdsValue, tdsRaw);
 
   // Read MQ-135 air quality sensor
   airQualityRaw = readAirQualityRaw();
@@ -345,8 +442,8 @@ void publishSensorData()
   // Create smaller JSON to avoid buffer issues
   JsonDocument sensorDoc;
   sensorDoc["device"] = MQTT_CLIENT_ID;
-  sensorDoc["time"] = millis() / 1000;  // shorter key
-  sensorDoc["soil"] = soilMoisture;     // shorter key
+  sensorDoc["time"] = millis() / 1000; // shorter key
+  sensorDoc["soil"] = soilMoisture;    // shorter key
   sensorDoc["temp"] = temperature;
   sensorDoc["hum"] = humidity;
   sensorDoc["air"] = airQuality;
@@ -357,28 +454,32 @@ void publishSensorData()
   sensorDoc["count"] = wateringCount;
   sensorDoc["wtime"] = totalWateringTime;
   sensorDoc["uptime"] = millis() / 1000;
+  // TDS short fields
+  sensorDoc["tdsRaw"] = tdsRaw;
+  sensorDoc["tds"] = tdsValue; // ppm (approx)
 
   String sensorPayload;
   serializeJson(sensorDoc, sensorPayload);
-  
+
   Serial.printf("🔧 JSON payload size: %d bytes\n", sensorPayload.length());
 
   // Try to publish to main topic
   bool mainPublished = mqttClient.publish(TOPIC_SENSORS, sensorPayload.c_str());
-  Serial.printf("📤 Published sensor data to %s: %s (success: %s)\n", 
+  Serial.printf("📤 Published sensor data to %s: %s (success: %s)\n",
                 TOPIC_SENSORS, sensorPayload.c_str(), mainPublished ? "YES" : "NO");
-  
+
   // If main publish fails, try simple test message
-  if (!mainPublished) {
+  if (!mainPublished)
+  {
     bool testPublished = mqttClient.publish("test/simple", "ESP32 test message");
     Serial.printf("📤 Simple test publish: %s\n", testPublished ? "YES" : "NO");
-    
+
     // Try even simpler JSON
     String simpleJson = "{\"device\":\"ESP32\",\"soil\":" + String(soilMoisture) + ",\"temp\":" + String(temperature) + "}";
     bool simplePublished = mqttClient.publish("test/json", simpleJson.c_str());
     Serial.printf("📤 Simple JSON publish (%d bytes): %s\n", simpleJson.length(), simplePublished ? "YES" : "NO");
   }
-  
+
   // Check MQTT client state after publish
   Serial.printf("🔧 MQTT State after publish: %d\n", mqttClient.state());
 }
@@ -421,15 +522,15 @@ void connectToMqtt()
 
     String statusPayload;
     serializeJson(statusDoc, statusPayload);
-    
+
     bool statusPublished = mqttClient.publish(TOPIC_SYSTEM_STATUS, statusPayload.c_str(), true); // retained
-    Serial.printf("📤 System status published: %s (success: %s)\n", 
+    Serial.printf("📤 System status published: %s (success: %s)\n",
                   statusPayload.c_str(), statusPublished ? "YES" : "NO");
 
     // Log connection
     bool logPublished = mqttClient.publish(TOPIC_LOGS, "Device connected to MQTT broker");
     Serial.printf("📤 Log published: %s\n", logPublished ? "YES" : "NO");
-    
+
     // Test publish a simple message
     bool testPublished = mqttClient.publish("test/agrohygra", "ESP32 is online and publishing");
     Serial.printf("📤 Test message published: %s\n", testPublished ? "YES" : "NO");
@@ -446,7 +547,7 @@ void setupMqtt()
 {
   // Set MQTT buffer size (default is only 256 bytes, too small for JSON)
   mqttClient.setBufferSize(512);
-  
+
   // Set MQTT server and callback
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
@@ -457,7 +558,15 @@ void setupMqtt()
 // ========== WEB SERVER - HALAMAN UTAMA ==========
 void handleRoot()
 {
-  String html = R"(
+  // If in AP mode, redirect to WiFi setup
+  if (isAPMode)
+  {
+    server.sendHeader("Location", "/wifi/setup");
+    server.send(302, "text/plain", "Redirecting to WiFi setup");
+    return;
+  }
+
+  String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -468,10 +577,13 @@ void handleRoot()
         body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; }
         .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
         h1 { color: #2e7d32; text-align: center; margin-bottom: 30px; }
-        .sensor-card { background: #e8f5e8; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #4caf50; }
+        .wifi-btn { display: inline-block; background: linear-gradient(90deg,#2e7d32,#43a047); color: white; padding: 12px 22px; border-radius: 8px; font-size: 16px; text-decoration: none; box-shadow: 0 6px 14px rgba(67,160,71,0.24); margin-bottom: 18px; }
+        .wifi-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(67,160,71,0.28); }
+        .sensor-card { background: #e8f5e8; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #4caf50; transition: all 0.3s ease; }
+        .sensor-card.updating { background: #fff9c4; }
         .sensor-value { font-size: 24px; font-weight: bold; color: #1b5e20; }
         .sensor-label { font-size: 14px; color: #666; }
-        .status { padding: 10px; border-radius: 5px; text-align: center; margin: 15px 0; font-weight: bold; }
+        .status { padding: 10px; border-radius: 5px; text-align: center; margin: 15px 0; font-weight: bold; transition: all 0.3s ease; }
         .status.on { background: #c8e6c9; color: #2e7d32; }
         .status.off { background: #ffcdd2; color: #c62828; }
         .controls { text-align: center; margin: 20px 0; }
@@ -481,98 +593,371 @@ void handleRoot()
         .btn:hover { opacity: 0.8; }
         .stats { background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 20px; }
         .refresh { font-size: 12px; color: #666; text-align: center; margin-top: 15px; }
+        .live-indicator { display: inline-block; width: 10px; height: 10px; background: #4caf50; border-radius: 50%; margin-right: 5px; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .error-msg { background: #ffebee; color: #c62828; padding: 10px; border-radius: 5px; margin: 10px 0; display: none; }
     </style>
     <script>
-        // Auto refresh setiap 30 detik
-        setTimeout(function(){ location.reload(); }, 30000);
+        let updateInterval;
+        
+        function updateData() {
+            fetch('/api/data')
+                .then(response => response.json())
+                .then(data => {
+                    // Update sensor values with smooth transition
+                    document.getElementById('soilMoisture').textContent = data.soilMoisture + '%';
+                    document.getElementById('temperature').textContent = data.temperature.toFixed(1) + '°C';
+                    document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
+                    document.getElementById('airQuality').textContent = data.airQuality + '% | ' + data.airQualityRaw + ' ADC';
+                    document.getElementById('airQualityStatus').textContent = 'Status: ' + (data.airQualityGood ? '🟢 Baik' : '🔴 Buruk') + ' | ~' + data.airQualityPPM + ' ppm';
+                    document.getElementById('tdsValue').textContent = data.tdsValuePPM + ' ppm | ' + data.tdsRaw + ' ADC';
+                    
+                    // Update pump status
+                    const pumpStatus = document.getElementById('pumpStatus');
+                    const isPumpOn = data.pumpActive;
+                    pumpStatus.className = 'status ' + (isPumpOn ? 'on' : 'off');
+                    pumpStatus.textContent = 'Status Pompa: ' + (isPumpOn ? '🟢 AKTIF' : '🔴 MATI');
+                    
+                    // Update statistics
+                    document.getElementById('wateringCount').textContent = data.wateringCount;
+                    document.getElementById('totalWateringTime').textContent = data.totalWateringTime;
+                    document.getElementById('uptime').textContent = data.uptime;
+                    document.getElementById('mqttStatus').textContent = data.mqttConnected ? '🟢 Connected' : '🔴 Disconnected';
+                    
+                    // Update last update time
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                    
+                    // Hide error message if any
+                    document.getElementById('errorMsg').style.display = 'none';
+                })
+                .catch(error => {
+                    console.error('Error fetching data:', error);
+                    document.getElementById('errorMsg').style.display = 'block';
+                    document.getElementById('errorMsg').textContent = '⚠️ Error updating data: ' + error.message;
+                });
+        }
+        
+        // Start auto-update when page loads
+        window.onload = function() {
+            // Update immediately
+            updateData();
+            // Then update every 2 seconds
+            updateInterval = setInterval(updateData, 2000);
+        };
+        
+        // Stop updates when page is hidden (battery saving)
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                clearInterval(updateInterval);
+            } else {
+                updateData();
+                updateInterval = setInterval(updateData, 2000);
+            }
+        });
     </script>
 </head>
 <body>
     <div class="container">
         <h1>🌱 AgroHygra</h1>
-        <h2 style="text-align: center; color: #666;">Smart Irrigation System</h2>
+        <h2 style="text-align: center; color: #666;">
+            <span class="live-indicator"></span>Smart Irrigation System (Live)
+        </h2>
+        <div style="text-align:center;">
+            <a href="/wifi/setup" class="wifi-btn">⚙️ Change WiFi Settings</a>
+        </div>
+        
+        <div id="errorMsg" class="error-msg"></div>
         
         <div class="sensor-card">
             <div class="sensor-label">Kelembapan Tanah</div>
-            <div class="sensor-value">)" +
-                String(soilMoisture) + R"(%</div>
+            <div class="sensor-value" id="soilMoisture">--</div>
         </div>
         
         <div class="sensor-card">
             <div class="sensor-label">Suhu Udara</div>
-            <div class="sensor-value">)" +
-                String(temperature, 1) + R"(°C</div>
+            <div class="sensor-value" id="temperature">--</div>
         </div>
         
         <div class="sensor-card">
             <div class="sensor-label">Kelembapan Udara</div>
-            <div class="sensor-value">)" +
-                String(humidity, 1) + R"(%</div>
+            <div class="sensor-value" id="humidity">--</div>
         </div>
         
         <div class="sensor-card">
             <div class="sensor-label">Kualitas Udara (MQ-135)</div>
-            <div class="sensor-value">)" +
-                String(airQuality) + R"(% | )" + String(airQualityRaw) + R"( ADC</div>
-            <div class="sensor-label">Status: )" +
-                String(airQualityGood ? "🟢 Baik" : "🔴 Buruk") + R"( | ~)" + String((int)calculatePPM(airQualityRaw)) + R"( ppm</div>
+            <div class="sensor-value" id="airQuality">--</div>
+            <div class="sensor-label" id="airQualityStatus">--</div>
         </div>
         
-        <div class="status )" +
-                String(pumpActive ? "on" : "off") + R"(">
-            Status Pompa: )" +
-                String(pumpActive ? "🟢 AKTIF" : "🔴 MATI") + R"(
+        <div class="sensor-card">
+            <div class="sensor-label">TDS Meter</div>
+            <div class="sensor-value" id="tdsValue">--</div>
+            <div class="sensor-label">Note: approximate, calibrate for accurate readings</div>
+        </div>
+        
+        <div class="status off" id="pumpStatus">
+            Status Pompa: 🔴 MATI
         </div>
         
         <div class="controls">
-            <a href="/pump/on" class="btn btn-primary">🚰 Nyalakan Pompa</a>
-            <a href="/pump/off" class="btn btn-secondary">🛑 Matikan Pompa</a>
+            <a href="/pump/on" class="btn btn-primary" onclick="setTimeout(updateData, 500)">&#x1F6B0; Nyalakan Pompa</a>
+            <a href="/pump/off" class="btn btn-secondary" onclick="setTimeout(updateData, 500)">&#x1F6D1; Matikan Pompa</a>
         </div>
         
         <div class="stats">
             <h3>📊 Statistik Sistem</h3>
-            <p><strong>Total Penyiraman:</strong> )" +
-                String(wateringCount) + R"( kali</p>
-            <p><strong>Total Waktu Pompa:</strong> )" +
-                String(totalWateringTime) + R"( detik</p>
-            <p><strong>Batas Penyiraman:</strong> ≤)" +
-                String(MOISTURE_THRESHOLD) + R"(%</p>
-            <p><strong>Batas Berhenti:</strong> ≥)" +
-                String(MOISTURE_STOP) + R"(%</p>
-            <p><strong>Uptime:</strong> )" +
-                String(millis() / 1000) + R"( detik</p>
-            <p><strong>WiFi Status:</strong> )" +
-                String(WiFi.status() == WL_CONNECTED ? "Terhubung (" + WiFi.localIP().toString() + ")" : "AP Mode") + R"(</p>
-            <p><strong>MQTT Status:</strong> )" +
-                String(mqttClient.connected() ? "🟢 Connected" : "🔴 Disconnected") + R"(</p>
+            <p><strong>Total Penyiraman:</strong> <span id="wateringCount">0</span> kali</p>
+            <p><strong>Total Waktu Pompa:</strong> <span id="totalWateringTime">0</span> detik</p>
+            <p><strong>Batas Penyiraman:</strong> &le;)rawliteral" +
+                String(MOISTURE_THRESHOLD) + R"rawliteral(%</p>
+            <p><strong>Batas Berhenti:</strong> &ge;)rawliteral" +
+                String(MOISTURE_STOP) + R"rawliteral(%</p>
+            <p><strong>Uptime:</strong> <span id="uptime">0</span> detik</p>
+            <p><strong>WiFi Status:</strong> )rawliteral" +
+                String(WiFi.status() == WL_CONNECTED ? "Terhubung (" + WiFi.localIP().toString() + ")" : "AP Mode") + R"rawliteral(</p>
+            <p><strong>MQTT Status:</strong> <span id="mqttStatus">--</span></p>
+            <p><a href="/wifi/setup" style="color: #2196F3; text-decoration: none;">⚙️ Change WiFi Settings</a></p>
         </div>
         
         <div class="stats">
             <h3>🌐 Remote Access</h3>
             <p><strong>MQTT Topics:</strong></p>
             <p style="font-size: 12px; font-family: monospace;">
-            📤 Sensor: )" +
-                String(TOPIC_SENSORS) + R"(<br>
-            📥 Pump Control: )" +
-                String(TOPIC_PUMP_COMMAND) + R"(<br>
-            📊 System Status: )" +
-                String(TOPIC_SYSTEM_STATUS) + R"(<br>
-            📋 Logs: )" +
-                String(TOPIC_LOGS) + R"(
+            📤 Sensor: )rawliteral" +
+                String(TOPIC_SENSORS) + R"rawliteral(<br>
+            📥 Pump Control: )rawliteral" +
+                String(TOPIC_PUMP_COMMAND) + R"rawliteral(<br>
+            📊 System Status: )rawliteral" +
+                String(TOPIC_SYSTEM_STATUS) + R"rawliteral(<br>
+            📋 Logs: )rawliteral" +
+                String(TOPIC_LOGS) + R"rawliteral(
             </p>
             <p><strong>Pump Commands:</strong> Send "ON"/"OFF" or {"pump":true/false}</p>
         </div>
         
         <div class="refresh">
-            🔄 Halaman akan refresh otomatis setiap 30 detik<br>
+            🔄 Data diperbarui secara realtime setiap 2 detik<br>
+            <span style="font-size: 11px;">Terakhir update: <span id="lastUpdate">--</span></span><br>
             <a href="/api/data" style="color: #4caf50;">📡 Data JSON</a>
         </div>
+    </div>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+// ========== WEB SERVER - WIFI SETUP ==========
+void handleWiFiSetup()
+{
+  // Scan networks if not already scanned
+  if (scannedNetworks.length() == 0)
+  {
+    scannedNetworks = scanWiFiNetworks();
+  }
+
+  // Get current WiFi info
+  String currentInfo = "";
+  if (WiFi.status() == WL_CONNECTED && !isAPMode)
+  {
+    currentInfo = R"(
+        <div style="background: #c8e6c9; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+            <strong>✅ Currently Connected:</strong><br>
+            SSID: <strong>)" +
+                  WiFi.SSID() + R"(</strong><br>
+            IP: <strong>)" +
+                  WiFi.localIP().toString() + R"(</strong><br>
+            Signal: <strong>)" +
+                  String(WiFi.RSSI()) + R"( dBm</strong>
+        </div>
+    )";
+  }
+  else if (savedSSID.length() > 0)
+  {
+    currentInfo = R"(
+        <div style="background: #ffecb3; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+            <strong>⚠️ Last Saved WiFi:</strong><br>
+            SSID: <strong>)" +
+                  savedSSID + R"(</strong><br>
+            Status: Not Connected
+        </div>
+    )";
+  }
+
+  String html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AgroHygra - WiFi Setup</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; }
+        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h1 { color: #2e7d32; text-align: center; margin-bottom: 10px; }
+        h2 { color: #666; text-align: center; font-size: 18px; margin-bottom: 30px; }
+        label { display: block; margin-top: 15px; color: #333; font-weight: bold; }
+        select, input { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; font-size: 16px; }
+        button { width: 100%; padding: 12px; margin-top: 20px; background: #4caf50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
+        button:hover { background: #45a049; }
+        .info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin-bottom: 20px; font-size: 14px; }
+        .btn-rescan { background: #ff9800; margin-top: 10px; }
+        .btn-rescan:hover { background: #f57c00; }
+        .btn-clear { background: #f44336; margin-top: 10px; }
+        .btn-clear:hover { background: #da190b; }
+        .btn-back { background: #2196F3; margin-top: 10px; }
+        .btn-back:hover { background: #0b7dda; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌱 AgroHygra</h1>
+        <h2>WiFi Configuration</h2>
+        
+        )" + currentInfo +
+                R"(
+        
+        <div class="info">
+            📡 Connect AgroHygra to your WiFi network.<br>
+            Select a network and enter the password below.
+        </div>
+        
+        <form action="/wifi/save" method="POST">
+            <label for="ssid">Select WiFi Network:</label>
+            <select name="ssid" id="ssid" required>
+                <option value="">-- Select Network --</option>
+                )" +
+                scannedNetworks + R"(
+            </select>
+            
+            <label for="password">WiFi Password:</label>
+            <input type="password" name="password" id="password" placeholder="Enter WiFi password" required>
+            
+            <button type="submit">💾 Save and Connect</button>
+        </form>
+        
+        <form action="/wifi/scan" method="GET">
+            <button type="submit" class="btn-rescan">🔄 Rescan Networks</button>
+        </form>
+        
+        <form action="/wifi/clear" method="POST" onsubmit="return confirm('Clear saved WiFi credentials? Device will restart in AP mode.');">
+            <button type="submit" class="btn-clear">🗑️ Clear WiFi Credentials</button>
+        </form>
+        
+        <form action="/" method="GET">
+            <button type="submit" class="btn-back">🏠 Back to Home</button>
+        </form>
     </div>
 </body>
 </html>
 )";
 
   server.send(200, "text/html", html);
+}
+
+void handleWiFiScan()
+{
+  scannedNetworks = scanWiFiNetworks();
+  server.sendHeader("Location", "/wifi/setup");
+  server.send(302, "text/plain", "Redirecting");
+}
+
+void handleWiFiSave()
+{
+  if (server.hasArg("ssid") && server.hasArg("password"))
+  {
+    String newSSID = server.arg("ssid");
+    String newPassword = server.arg("password");
+
+    saveWiFiCredentials(newSSID, newPassword);
+
+    String html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Saved</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; text-align: center; padding-top: 50px; }
+        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h1 { color: #4caf50; }
+        p { font-size: 16px; color: #666; margin: 20px 0; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #4caf50; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+    <script>
+        setTimeout(function(){ 
+            window.location.href = "/"; 
+        }, 8000);
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>✅ WiFi Credentials Saved!</h1>
+        <p>SSID: <strong>)" +
+                  newSSID + R"(</strong></p>
+        <p>ESP32 will restart and connect to the network...</p>
+        <div class="spinner"></div>
+        <p style="font-size: 14px; color: #999;">Redirecting in 8 seconds...</p>
+    </div>
+</body>
+</html>
+)";
+
+    server.send(200, "text/html", html);
+
+    delay(2000);
+    Serial.println("🔄 Restarting ESP32 to connect to new WiFi...");
+    delay(1000);
+    ESP.restart();
+  }
+  else
+  {
+    server.send(400, "text/plain", "Missing SSID or password");
+  }
+}
+
+void handleWiFiClear()
+{
+  clearWiFiCredentials();
+
+  String html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Cleared</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; text-align: center; padding-top: 50px; }
+        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h1 { color: #f44336; }
+        p { font-size: 16px; color: #666; margin: 20px 0; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #f44336; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🗑️ WiFi Credentials Cleared!</h1>
+        <p>ESP32 will restart in AP mode...</p>
+        <p>Connect to: <strong>AgroHygra-Setup</strong></p>
+        <p>Password: <strong>agrohygra123</strong></p>
+        <div class="spinner"></div>
+        <p style="font-size: 14px; color: #999;">Restarting...</p>
+    </div>
+</body>
+</html>
+)";
+
+  server.send(200, "text/html", html);
+
+  delay(2000);
+  Serial.println("🔄 Restarting ESP32 in AP mode...");
+  delay(1000);
+  ESP.restart();
 }
 
 // ========== WEB SERVER - KONTROL POMPA ==========
@@ -602,6 +987,9 @@ void handleAPI()
   json["airQualityRaw"] = airQualityRaw;
   json["airQualityGood"] = airQualityGood;
   json["airQualityPPM"] = (int)calculatePPM(airQualityRaw);
+  // verbose TDS info for API
+  json["tdsRaw"] = tdsRaw;
+  json["tdsValuePPM"] = tdsValue;
   json["pumpActive"] = pumpActive;
   json["wateringCount"] = wateringCount;
   json["totalWateringTime"] = totalWateringTime;
@@ -667,51 +1055,72 @@ void setup()
   // Inisialisasi sensor DHT
   dht.begin();
 
+  // Load WiFi credentials from flash
+  loadWiFiCredentials();
+
   // Koneksi WiFi
-  Serial.print("🔗 Menghubungkan ke WiFi: ");
-  Serial.println(ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  int wifiTimeout = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 30)
+  if (savedSSID.length() > 0)
   {
-    delay(1000);
-    Serial.print(".");
-    wifiTimeout++;
-  }
+    Serial.print("🔗 Menghubungkan ke WiFi: ");
+    Serial.println(savedSSID);
 
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("\n✅ WiFi terhubung!");
-    Serial.print("📡 IP Address: ");
-    Serial.println(WiFi.localIP());
-    Serial.println("🌐 Akses web interface di: http://" + WiFi.localIP().toString());
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
 
-    // Setup mDNS (bisa akses via http://agrohygra.local)
-    if (MDNS.begin("agrohygra"))
+    int wifiTimeout = 0;
+    while (WiFi.status() != WL_CONNECTED && wifiTimeout < 30)
     {
-      Serial.println("🌐 mDNS started: http://agrohygra.local");
+      delay(1000);
+      Serial.print(".");
+      wifiTimeout++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      isAPMode = false;
+      Serial.println("\n✅ WiFi terhubung!");
+      Serial.print("📡 IP Address: ");
+      Serial.println(WiFi.localIP());
+      Serial.println("🌐 Akses web interface di: http://" + WiFi.localIP().toString());
+
+      // Setup mDNS (bisa akses via http://agrohygra.local)
+      if (MDNS.begin("agrohygra"))
+      {
+        Serial.println("🌐 mDNS started: http://agrohygra.local");
+      }
+    }
+    else
+    {
+      Serial.println("\n❌ WiFi gagal terhubung! Memulai Access Point mode...");
+      isAPMode = true;
     }
   }
   else
   {
-    Serial.println("\n❌ WiFi gagal terhubung! Memulai Access Point mode...");
-    // Setup sebagai Access Point untuk akses langsung
+    Serial.println("⚠️  No WiFi credentials saved. Starting AP mode...");
+    isAPMode = true;
+  }
+
+  // Setup sebagai Access Point jika belum connect atau tidak ada credentials
+  if (isAPMode)
+  {
     WiFi.mode(WIFI_AP);
-    const char *ap_ssid = "AgroHygra-ESP32";
+    const char *ap_ssid = "AgroHygra-Setup";
     const char *ap_password = "agrohygra123";
 
     bool apStarted = WiFi.softAP(ap_ssid, ap_password);
     if (apStarted)
     {
       IPAddress apIP = WiFi.softAPIP();
-      Serial.println("✅ Access Point berhasil dimulai!");
+      Serial.println("✅ Access Point dimulai untuk konfigurasi WiFi!");
       Serial.println("📡 SSID: " + String(ap_ssid));
       Serial.println("🔐 Password: " + String(ap_password));
       Serial.println("🌐 IP Address: " + apIP.toString());
-      Serial.println("🌐 Akses web interface di: http://" + apIP.toString());
+      Serial.println("🌐 Akses WiFi setup di: http://" + apIP.toString());
+      Serial.println("   atau http://192.168.4.1");
+
+      // Scan networks on startup for AP mode
+      scannedNetworks = scanWiFiNetworks();
     }
     else
     {
@@ -721,6 +1130,10 @@ void setup()
 
   // Setup web server routes
   server.on("/", handleRoot);
+  server.on("/wifi/setup", handleWiFiSetup);
+  server.on("/wifi/scan", handleWiFiScan);
+  server.on("/wifi/save", HTTP_POST, handleWiFiSave);
+  server.on("/wifi/clear", HTTP_POST, handleWiFiClear);
   server.on("/pump/on", handlePumpOn);
   server.on("/pump/off", handlePumpOff);
   server.on("/api/data", handleAPI);
@@ -739,7 +1152,15 @@ void setup()
   // Print final access instructions
   Serial.println("=====================================");
   Serial.println("✅ SISTEM SIAP DIGUNAKAN!");
-  if (WiFi.status() == WL_CONNECTED)
+  if (isAPMode)
+  {
+    Serial.println("🔧 MODE: WiFi Setup (Access Point)");
+    Serial.println("📱 Hubungkan ke WiFi 'AgroHygra-Setup'");
+    Serial.println("🔐 Password: agrohygra123");
+    Serial.println("📱 Lalu buka browser ke: http://192.168.4.1");
+    Serial.println("   untuk konfigurasi WiFi");
+  }
+  else if (WiFi.status() == WL_CONNECTED)
   {
     Serial.println("📱 Buka browser dan kunjungi:");
     Serial.println("   http://" + WiFi.localIP().toString());
@@ -747,20 +1168,27 @@ void setup()
   }
   else
   {
-    Serial.println("📱 Hubungkan ke WiFi 'AgroHygra-ESP32'");
+    Serial.println("📱 Hubungkan ke WiFi 'AgroHygra-Setup'");
     Serial.println("🔐 Password: agrohygra123");
     Serial.println("📱 Lalu buka browser ke: http://192.168.4.1");
   }
   Serial.println("=====================================");
 
   // Baca sensor pertama kali
-  readAllSensors();
+  if (!isAPMode)
+  {
+    readAllSensors();
 
-  Serial.println("✅ Sistem siap!");
-  Serial.printf("🌾 Kelembapan tanah saat ini: %d%%\n", soilMoisture);
-  Serial.printf("🌡️  Suhu: %.1f°C, Kelembapan udara: %.1f%%\n", temperature, humidity);
-  Serial.printf("🌬️  Kualitas udara: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
-                airQuality, airQualityRaw, airQualityGood ? "Baik" : "Buruk", (int)calculatePPM(airQualityRaw));
+    Serial.println("✅ Sistem siap!");
+    Serial.printf("🌾 Kelembapan tanah saat ini: %d%%\n", soilMoisture);
+    Serial.printf("🌡️  Suhu: %.1f°C, Kelembapan udara: %.1f%%\n", temperature, humidity);
+    Serial.printf("🌬️  Kualitas udara: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
+                  airQuality, airQualityRaw, airQualityGood ? "Baik" : "Buruk", (int)calculatePPM(airQualityRaw));
+  }
+  else
+  {
+    Serial.println("✅ Sistem dalam mode setup WiFi");
+  }
   Serial.println("=====================================");
 
   // Configure ADC for soil sensor and MQ-135 (ESP32)
@@ -769,6 +1197,11 @@ void setup()
   // Set attenuation to allow reading full range with sensor values (0-3.3V)
   analogSetPinAttenuation(SOIL_PIN, ADC_11db);
   analogSetPinAttenuation(MQ135_AO_PIN, ADC_11db);
+  // Configure TDS pin attenuation (use ADC1 pin to avoid WiFi conflicts)
+  analogSetPinAttenuation(TDS_PIN, ADC_11db);
+
+  // NOTE: If your TDS module is powered at 5V and A output ranges up to 5V, DO NOT
+  // connect directly to the ESP32 ADC. Use a voltage divider to bring 0-5V down to 0-3.3V.
 }
 
 // ========== LOOP UTAMA ==========
@@ -776,6 +1209,13 @@ void loop()
 {
   // Handle web server
   server.handleClient();
+
+  // Skip sensor and MQTT operations if in AP setup mode
+  if (isAPMode)
+  {
+    delay(100);
+    return;
+  }
 
   // Monitor WiFi connection (ESP32 specific)
   static unsigned long lastWiFiCheck = 0;
@@ -820,12 +1260,13 @@ void loop()
       lastMqttSensorPublish = millis();
       publishSensorData();
     }
-    
+
     // Debug MQTT connection status every 10 seconds
     static unsigned long lastMqttDebug = 0;
-    if (millis() - lastMqttDebug >= 10000) {
+    if (millis() - lastMqttDebug >= 10000)
+    {
       lastMqttDebug = millis();
-      Serial.printf("🔧 MQTT Status: Connected=%s, State=%d\n", 
+      Serial.printf("🔧 MQTT Status: Connected=%s, State=%d\n",
                     mqttClient.connected() ? "YES" : "NO", mqttClient.state());
     }
   }
