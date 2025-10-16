@@ -10,14 +10,14 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// ========== KONFIGURASI WIFI ==========
+// ========== WIFI CONFIGURATION ==========
 // WiFi credentials will be stored in Preferences (non-volatile storage)
 // User can configure via web portal when in AP mode
 String savedSSID = "";
 String savedPassword = "";
 Preferences preferences;
 
-// ========== KONFIGURASI MQTT ==========
+// ========== MQTT CONFIGURATION ==========
 // Public MQTT broker for testing (no authentication required)
 // For production, use HiveMQ Cloud with TLS and authentication
 const char *MQTT_HOST = "broker.hivemq.com";    // Free public broker
@@ -38,7 +38,7 @@ const char *TOPIC_LOGS = "agrohygra/logs";
 // - test.mosquitto.org:1883 (public, no auth, no TLS)
 // For production, use TLS + authentication (HiveMQ Cloud, CloudMQTT, AWS IoT, etc.)
 
-// ========== KONFIGURASI PIN ==========
+// ========== PIN CONFIGURATION ==========
 // Wiring notes:
 // - Capacitive soil moisture sensor: VCC -> 3.3V, GND -> GND, AOUT -> analog input (SOIL_PIN)
 //   Use 3.3V to power the sensor when connecting to ESP32. Many breakout boards work with 3.3V.
@@ -47,43 +47,43 @@ const char *TOPIC_LOGS = "agrohygra/logs";
 // - LCD I2C 16x2: VCC -> 5V, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22
 //   Most I2C LCD modules work at 5V. ESP32 I2C pins are 3.3V but usually compatible.
 //   Default I2C address is 0x27 or 0x3F (check your module).
-#define DHT_PIN 4      // Pin sensor suhu/kelembapan udara (DHT11)
-#define DHT_TYPE DHT11 // Jenis sensor DHT
-#define I2C_SDA 21     // Pin I2C SDA untuk LCD (default ESP32)
-#define I2C_SCL 22     // Pin I2C SCL untuk LCD (default ESP32)
+#define DHT_PIN 4      // Temperature/humidity sensor pin (DHT11)
+#define DHT_TYPE DHT11 // DHT sensor type
+#define I2C_SDA 21     // I2C SDA pin for LCD (default ESP32)
+#define I2C_SCL 22     // I2C SCL pin for LCD (default ESP32)
 // Recommended analog pins for ESP32 (ADC1): 32, 33, 34, 35, 36, 39
 // Use an ADC1 pin to avoid conflicts with WiFi (ADC2 is shared with WiFi)
 // Use GPIO34 as default for the capacitive soil sensor's AOUT
-#define SOIL_PIN 34 // Pin analog untuk capacitive soil moisture sensor (AOUT -> this pin)
+#define SOIL_PIN 34 // Analog pin for capacitive soil moisture sensor (AOUT -> this pin)
 // MQ-135 air quality sensor wiring: VCC -> 5V or 3.3V, GND -> GND, AO -> analog pin, DO -> digital pin (optional)
 // AO gives analog reading (0-4095 on ESP32), DO gives digital threshold output (HIGH/LOW based on onboard potentiometer)
 // Use ADC1 pins to avoid WiFi conflicts. For digital pin, use any available GPIO.
-#define MQ135_AO_PIN 35 // Pin analog untuk MQ-135 AO (air quality analog output)
-#define MQ135_DO_PIN 32 // Pin digital untuk MQ-135 DO (digital threshold output) - optional
-#define TDS_PIN 33      // Pin analog untuk TDS meter (A -> this pin). Use ADC1 pin (32-39) to avoid WiFi conflicts
+#define MQ135_AO_PIN 35 // Analog pin for MQ-135 AO (air quality analog output)
+#define MQ135_DO_PIN 32 // Digital pin for MQ-135 DO (digital threshold output) - optional
+#define TDS_PIN 33      // Analog pin for TDS meter (A -> this pin). Use ADC1 pin (32-39) to avoid WiFi conflicts
 // Relay wiring: VCC, GND, IN. Relay module output pins: COM (common), NO (normally open), NC (normally closed).
 // For a pump, wire the pump's power supply through COM -> NO (pump powered when relay ON) for normally-open behavior.
 // Many 1-channel relay modules are active-low for the IN pin (drive LOW to activate). If unsure, test carefully.
 // If your relay module requires 5V VCC and a separate JD-VCC, follow the module documentation. Use an external power supply for the pump and common ground between ESP32 and relay module when needed.
-#define RELAY_PIN 27 // Pin relay untuk pompa air (IN pin)
+#define RELAY_PIN 27 // Relay pin for water pump (IN pin)
 // Set to true if your relay module is active-low (IN pulled LOW to activate relay). Most cheap modules are active-low.
 #define RELAY_ACTIVE_LOW true
-#define LED_STATUS_PIN 2 // Pin LED built-in ESP32 untuk indikator status
+#define LED_STATUS_PIN 2 // Built-in ESP32 LED pin for status indicator
 
-// ========== KONFIGURASI SENSOR & SISTEM ==========
-const int SOIL_DRY_VALUE = 3000;    // Nilai ADC saat tanah kering (kalibrasi)
-const int SOIL_WET_VALUE = 1000;    // Nilai ADC saat tanah basah (kalibrasi)
-const int MOISTURE_THRESHOLD = 30;  // Batas kelembapan untuk mulai menyiram (%)
-const int MOISTURE_STOP = 70;       // Batas kelembapan untuk berhenti menyiram (%)
-const int MAX_PUMP_TIME = 60;       // Maksimal pompa nyala (detik) untuk safety
-const int SENSOR_READ_INTERVAL = 2; // Interval pembacaan sensor (detik)
+// ========== SENSOR & SYSTEM CONFIGURATION ==========
+const int SOIL_DRY_VALUE = 3000;    // ADC value when soil is dry (calibration)
+const int SOIL_WET_VALUE = 1000;    // ADC value when soil is wet (calibration)
+const int MOISTURE_THRESHOLD = 30;  // Moisture threshold to start irrigation (%)
+const int MOISTURE_STOP = 70;       // Moisture threshold to stop irrigation (%)
+const int MAX_PUMP_TIME = 60;       // Maximum pump run time (seconds) for safety
+const int SENSOR_READ_INTERVAL = 2; // Sensor reading interval (seconds)
 
 // Safety: do not auto-start pump immediately after boot. Require a short delay
 // and require multiple consecutive "dry" readings to avoid false positives.
 const unsigned long BOOT_SAFE_DELAY = 15000; // ms to wait after boot before auto irrigation
 const int REQUIRED_CONSECUTIVE_DRY = 2;      // number of consecutive dry readings required before starting pump
 
-// ========== KONFIGURASI MQ-135 AIR QUALITY ==========
+// ========== MQ-135 AIR QUALITY CONFIGURATION ==========
 const int MQ135_CLEAN_AIR_VALUE = 500;     // Typical ADC value in clean air (calibrate in fresh air)
 const int MQ135_POLLUTED_THRESHOLD = 1500; // ADC value indicating poor air quality (adjust based on environment)
 const float MQ135_VOLTAGE_REF = 3.3;       // Reference voltage for ADC (3.3V for ESP32)
@@ -92,12 +92,12 @@ const float MQ135_ADC_MAX = 4095.0;        // 12-bit ADC max value
 const float MQ135_RL_VALUE = 20.0;    // Load resistance on sensor board (kOhm) - check your module
 const float MQ135_RO_CLEAN_AIR = 3.6; // Sensor resistance in clean air (kOhm) - calibrate this
 
-// ========== VARIABEL GLOBAL ==========
+// ========== GLOBAL VARIABLES ==========
 DHT dht(DHT_PIN, DHT_TYPE);
 WebServer server(80);
 WiFiClient espClient; // Use regular WiFiClient for non-TLS
 PubSubClient mqttClient(espClient);
-// LCD I2C - alamat default 0x27 (atau 0x3F untuk beberapa modul)
+// LCD I2C - default address 0x27 (or 0x3F for some modules)
 // Format: LiquidCrystal_I2C(address, columns, rows)
 // Use pointer to allow dynamic instantiation after I2C address scan
 LiquidCrystal_I2C *lcd = nullptr;
@@ -137,7 +137,7 @@ const unsigned long LCD_UPDATE_INTERVAL = 2000; // Update LCD every 2 seconds
 int lcdPage = 0;                                // 0=soil+temp, 1=humidity+air, 2=TDS+pump, 3=wifi+mqtt, 4=ssid+ip
 const int LCD_PAGES = 5;
 
-// ========== FUNGSI WIFI MANAGER ==========
+// ========== WIFI MANAGER FUNCTIONS ==========
 void saveWiFiCredentials(String ssid, String password)
 {
   preferences.begin("wifi", false);
@@ -200,7 +200,7 @@ String scanWiFiNetworks()
   return networks;
 }
 
-// ========== FUNGSI SENSOR ==========
+// ========== SENSOR FUNCTIONS ==========
 int readSoilMoisture()
 {
   // Read multiple samples and average for stability
@@ -214,14 +214,14 @@ int readSoilMoisture()
   int rawValue = sum / samples;
 
   // ADC on ESP32 returns 0-4095 (12-bit) for default resolution; adjust SOIL_DRY/WET values accordingly
-  // Konversi ke persentase (0-100%)
+  // Convert to percentage (0-100%)
   int moisture = map(rawValue, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100);
-  moisture = constrain(moisture, 0, 100); // Batasi nilai 0-100%
+  moisture = constrain(moisture, 0, 100); // Limit value to 0-100%
 
   return moisture;
 }
 
-// ========== FUNGSI MQ-135 AIR QUALITY ==========
+// ========== MQ-135 AIR QUALITY FUNCTIONS ==========
 int readAirQualityRaw()
 {
   // Read multiple samples and average for stability
@@ -291,7 +291,7 @@ void readAllSensors()
   airQuality = calculateAirQualityPercent(airQualityRaw);
   airQualityGood = digitalRead(MQ135_DO_PIN) == LOW; // DO pin is typically LOW for good air quality
 
-  // Cek apakah pembacaan DHT berhasil
+  // Check if DHT readings were successful
   if (isnan(temperature))
     temperature = 0;
   if (isnan(humidity))
@@ -308,7 +308,7 @@ void readAllSensors()
   }
 }
 
-// ========== FUNGSI LCD DISPLAY ==========
+// ========== LCD DISPLAY FUNCTIONS ==========
 void updateLCD()
 {
   if (!lcd)
@@ -320,7 +320,7 @@ void updateLCD()
   {
   case 0: // Soil moisture & Temperature
     lcd->setCursor(0, 0);
-    lcd->print("Tanah:");
+    lcd->print("Soil:");
     lcd->print(soilMoisture);
     lcd->print("%");
     if (soilMoisture <= MOISTURE_THRESHOLD)
@@ -333,7 +333,7 @@ void updateLCD()
     }
 
     lcd->setCursor(0, 1);
-    lcd->print("Suhu:");
+    lcd->print("Temp:");
     lcd->print(temperature, 1);
     lcd->print((char)223); // degree symbol
     lcd->print("C");
@@ -341,12 +341,12 @@ void updateLCD()
 
   case 1: // Humidity & Air Quality
     lcd->setCursor(0, 0);
-    lcd->print("Kelembapan:");
+    lcd->print("Humidity:");
     lcd->print(humidity, 1);
     lcd->print("%");
 
     lcd->setCursor(0, 1);
-    lcd->print("Udara:");
+    lcd->print("Air:");
     lcd->print(airQuality);
     lcd->print("% ");
     lcd->print(airQualityGood ? "OK" : "BAD");
@@ -359,7 +359,7 @@ void updateLCD()
     lcd->print(" ppm");
 
     lcd->setCursor(0, 1);
-    lcd->print("Pompa:");
+    lcd->print("Pump:");
     if (pumpActive)
     {
       lcd->print("ON ");
@@ -439,7 +439,7 @@ void updateLCD()
   lcdPage = (lcdPage + 1) % LCD_PAGES;
 }
 
-// ========== FUNGSI KONTROL POMPA ==========
+// ========== PUMP CONTROL FUNCTIONS ==========
 void startPump()
 {
   if (!pumpActive)
@@ -452,7 +452,7 @@ void startPump()
     pumpActive = true;
     pumpStartTime = millis();
     wateringCount++;
-    Serial.println("🚰 POMPA DINYALAKAN - Kelembapan tanah rendah");
+    Serial.println("🚰 PUMP ACTIVATED - Soil moisture low");
 
     // Notify via MQTT
     if (mqttClient.connected())
@@ -474,11 +474,11 @@ void stopPump()
       digitalWrite(RELAY_PIN, LOW);
     pumpActive = false;
 
-    // Catat waktu penyiraman
+    // Record watering duration
     unsigned long wateringDuration = (millis() - pumpStartTime) / 1000;
     totalWateringTime += wateringDuration;
 
-    Serial.printf("🛑 POMPA DIMATIKAN - Durasi: %lu detik\n", wateringDuration);
+    Serial.printf("🛑 PUMP DEACTIVATED - Duration: %lu seconds\n", wateringDuration);
 
     // Notify via MQTT
     if (mqttClient.connected())
@@ -490,18 +490,18 @@ void stopPump()
   }
 }
 
-// ========== LOGIKA IRIGASI OTOMATIS ==========
+// ========== AUTO IRRIGATION LOGIC ==========
 void autoIrrigation()
 {
   // Safety: do not auto-start immediately after boot
   if (millis() < BOOT_SAFE_DELAY)
   {
     // optional: if pump is currently active we still enforce safety timeout elsewhere
-    Serial.println("⚠️  Menunda auto-irigasi (boot safe delay)");
+    Serial.println("⚠️  Delaying auto-irrigation (boot safe delay)");
     return;
   }
 
-  // Mulai penyiraman jika kelembapan rendah
+  // Start watering if moisture is low
   if (!pumpActive && soilMoisture <= MOISTURE_THRESHOLD)
   {
     // require multiple consecutive dry readings to avoid false triggers
@@ -511,20 +511,20 @@ void autoIrrigation()
     }
     else
     {
-      Serial.printf("⚠️  Terbaca kering (%d%%) — but waiting for %d consecutive readings (have %d)\n", soilMoisture, REQUIRED_CONSECUTIVE_DRY, consecutiveDryCount);
+      Serial.printf("⚠️  Dry reading detected (%d%%) — but waiting for %d consecutive readings (have %d)\n", soilMoisture, REQUIRED_CONSECUTIVE_DRY, consecutiveDryCount);
     }
   }
 
-  // Hentikan penyiraman jika kelembapan sudah cukup
+  // Stop watering if moisture is sufficient
   if (pumpActive && soilMoisture >= MOISTURE_STOP)
   {
     stopPump();
   }
 
-  // Safety: hentikan pompa jika sudah terlalu lama nyala
+  // Safety: stop pump if it has been running too long
   if (pumpActive && (millis() - pumpStartTime) >= (MAX_PUMP_TIME * 1000UL))
   {
-    Serial.println("⚠️  SAFETY: Pompa dimatikan karena timeout!");
+    Serial.println("⚠️  SAFETY: Pump deactivated due to timeout!");
     stopPump();
   }
 }
@@ -703,15 +703,20 @@ void setupMqtt()
   Serial.printf("🔧 MQTT configured for %s:%d (buffer size: 512)\n", MQTT_HOST, MQTT_PORT);
 }
 
-// ========== WEB SERVER - HALAMAN UTAMA ==========
+// ========== WEB SERVER - MAIN PAGE ==========
 void handleRoot()
 {
-  // If in AP mode, redirect to WiFi setup
+  // Show main page even in AP mode. If AP mode is active, show a prominent banner
+  // with connection instructions and a link to the WiFi setup page instead of redirecting.
+  String apBanner = "";
   if (isAPMode)
   {
-    server.sendHeader("Location", "/wifi/setup");
-    server.send(302, "text/plain", "Redirecting to WiFi setup");
-    return;
+    apBanner = R"rawliteral(
+        <div style="background:#fff3cd;padding:12px;border-radius:8px;border:1px solid #ffeeba;margin-bottom:12px;text-align:center;">
+          <strong>⚠️ AP Mode Active</strong><br>
+          Connect to <code>AgroHygra-Setup</code> (Open Network) or <a href="/wifi/setup">Open WiFi Setup</a>
+        </div>
+    )rawliteral";
   }
 
   String html = R"rawliteral(
@@ -757,14 +762,14 @@ void handleRoot()
                     document.getElementById('temperature').textContent = data.temperature.toFixed(1) + '°C';
                     document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
                     document.getElementById('airQuality').textContent = data.airQuality + '% | ' + data.airQualityRaw + ' ADC';
-                    document.getElementById('airQualityStatus').textContent = 'Status: ' + (data.airQualityGood ? '🟢 Baik' : '🔴 Buruk') + ' | ~' + data.airQualityPPM + ' ppm';
+                    document.getElementById('airQualityStatus').textContent = 'Status: ' + (data.airQualityGood ? '🟢 Good' : '🔴 Poor') + ' | ~' + data.airQualityPPM + ' ppm';
                     document.getElementById('tdsValue').textContent = data.tdsValuePPM + ' ppm | ' + data.tdsRaw + ' ADC';
                     
                     // Update pump status
                     const pumpStatus = document.getElementById('pumpStatus');
                     const isPumpOn = data.pumpActive;
                     pumpStatus.className = 'status ' + (isPumpOn ? 'on' : 'off');
-                    pumpStatus.textContent = 'Status Pompa: ' + (isPumpOn ? '🟢 AKTIF' : '🔴 MATI');
+                    pumpStatus.textContent = 'Pump Status: ' + (isPumpOn ? '🟢 ACTIVE' : '🔴 OFF');
                     
                     // Update statistics
                     document.getElementById('wateringCount').textContent = data.wateringCount;
@@ -786,7 +791,7 @@ void handleRoot()
         }
         
         // Start auto-update when page loads
-        window.onload = function() {
+        window.onload = function() {  
             // Update immediately
             updateData();
             // Then update every 2 seconds
@@ -805,7 +810,9 @@ void handleRoot()
     </script>
 </head>
 <body>
-    <div class="container">
+  <div class="container">
+" )rawliteral" + apBanner +
+                R"rawliteral(
         <h1>🌱 AgroHygra</h1>
         <h2 style="text-align: center; color: #666;">
             <span class="live-indicator"></span>Smart Irrigation System (Live)
@@ -817,22 +824,22 @@ void handleRoot()
         <div id="errorMsg" class="error-msg"></div>
         
         <div class="sensor-card">
-            <div class="sensor-label">Kelembapan Tanah</div>
+            <div class="sensor-label">Soil Moisture</div>
             <div class="sensor-value" id="soilMoisture">--</div>
         </div>
         
         <div class="sensor-card">
-            <div class="sensor-label">Suhu Udara</div>
+            <div class="sensor-label">Air Temperature</div>
             <div class="sensor-value" id="temperature">--</div>
         </div>
         
         <div class="sensor-card">
-            <div class="sensor-label">Kelembapan Udara</div>
+            <div class="sensor-label">Air Humidity</div>
             <div class="sensor-value" id="humidity">--</div>
         </div>
         
         <div class="sensor-card">
-            <div class="sensor-label">Kualitas Udara (MQ-135)</div>
+            <div class="sensor-label">Air Quality (MQ-135)</div>
             <div class="sensor-value" id="airQuality">--</div>
             <div class="sensor-label" id="airQualityStatus">--</div>
         </div>
@@ -844,25 +851,25 @@ void handleRoot()
         </div>
         
         <div class="status off" id="pumpStatus">
-            Status Pompa: 🔴 MATI
+            Pump Status: 🔴 OFF
         </div>
         
         <div class="controls">
-            <a href="/pump/on" class="btn btn-primary" onclick="setTimeout(updateData, 500)">&#x1F6B0; Nyalakan Pompa</a>
-            <a href="/pump/off" class="btn btn-secondary" onclick="setTimeout(updateData, 500)">&#x1F6D1; Matikan Pompa</a>
+            <a href="/pump/on" class="btn btn-primary" onclick="setTimeout(updateData, 500)">&#x1F6B0; Turn On Pump</a>
+            <a href="/pump/off" class="btn btn-secondary" onclick="setTimeout(updateData, 500)">&#x1F6D1; Turn Off Pump</a>
         </div>
         
         <div class="stats">
-            <h3>📊 Statistik Sistem</h3>
-            <p><strong>Total Penyiraman:</strong> <span id="wateringCount">0</span> kali</p>
-            <p><strong>Total Waktu Pompa:</strong> <span id="totalWateringTime">0</span> detik</p>
-            <p><strong>Batas Penyiraman:</strong> &le;)rawliteral" +
+            <h3>📊 System Statistics</h3>
+            <p><strong>Total Watering:</strong> <span id="wateringCount">0</span> times</p>
+            <p><strong>Total Pump Time:</strong> <span id="totalWateringTime">0</span> seconds</p>
+            <p><strong>Start Irrigation:</strong> &le;)rawliteral" +
                 String(MOISTURE_THRESHOLD) + R"rawliteral(%</p>
-            <p><strong>Batas Berhenti:</strong> &ge;)rawliteral" +
+            <p><strong>Stop Irrigation:</strong> &ge;)rawliteral" +
                 String(MOISTURE_STOP) + R"rawliteral(%</p>
-            <p><strong>Uptime:</strong> <span id="uptime">0</span> detik</p>
+            <p><strong>Uptime:</strong> <span id="uptime">0</span> seconds</p>
             <p><strong>WiFi Status:</strong> )rawliteral" +
-                String(WiFi.status() == WL_CONNECTED ? "Terhubung (" + WiFi.localIP().toString() + ")" : "AP Mode") + R"rawliteral(</p>
+                String(WiFi.status() == WL_CONNECTED ? "Connected (" + WiFi.localIP().toString() + ")" : "AP Mode") + R"rawliteral(</p>
             <p><strong>MQTT Status:</strong> <span id="mqttStatus">--</span></p>
             <p><a href="/wifi/setup" style="color: #2196F3; text-decoration: none;">⚙️ Change WiFi Settings</a></p>
         </div>
@@ -884,9 +891,9 @@ void handleRoot()
         </div>
         
         <div class="refresh">
-            🔄 Data diperbarui secara realtime setiap 2 detik<br>
-            <span style="font-size: 11px;">Terakhir update: <span id="lastUpdate">--</span></span><br>
-            <a href="/api/data" style="color: #4caf50;">📡 Data JSON</a>
+            🔄 Data updated in real-time every 2 seconds<br>
+            <span style="font-size: 11px;">Last update: <span id="lastUpdate">--</span></span><br>
+            <a href="/api/data" style="color: #4caf50;">📡 JSON Data</a>
         </div>
     </div>
 </body>
@@ -1091,8 +1098,7 @@ void handleWiFiClear()
     <div class="container">
         <h1>🗑️ WiFi Credentials Cleared!</h1>
         <p>ESP32 will restart in AP mode...</p>
-        <p>Connect to: <strong>AgroHygra-Setup</strong></p>
-        <p>Password: <strong>agrohygra123</strong></p>
+        <p>Connect to: <strong>AgroHygra-Setup</strong> (Open Network)</p>
         <div class="spinner"></div>
         <p style="font-size: 14px; color: #999;">Restarting...</p>
     </div>
@@ -1108,19 +1114,19 @@ void handleWiFiClear()
   ESP.restart();
 }
 
-// ========== WEB SERVER - KONTROL POMPA ==========
+// ========== WEB SERVER - PUMP CONTROL ==========
 void handlePumpOn()
 {
   startPump();
   server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "Pompa dinyalakan");
+  server.send(302, "text/plain", "Pump turned on");
 }
 
 void handlePumpOff()
 {
   stopPump();
   server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "Pompa dimatikan");
+  server.send(302, "text/plain", "Pump turned off");
 }
 
 // ========== API JSON ==========
@@ -1166,7 +1172,7 @@ void updateStatusLED()
 
   if (pumpActive)
   {
-    // Kedip cepat saat pompa aktif
+    // Fast blink when pump is active
     if (millis() - lastBlink >= 250)
     {
       ledState = !ledState;
@@ -1176,7 +1182,7 @@ void updateStatusLED()
   }
   else
   {
-    // Nyala terus saat standby
+    // Always on during standby
     digitalWrite(LED_STATUS_PIN, HIGH);
   }
 }
@@ -1192,7 +1198,7 @@ void setup()
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_STATUS_PIN, OUTPUT);
   pinMode(MQ135_DO_PIN, INPUT); // MQ-135 digital output pin
-  // Pastikan pompa mati saat start (respect relay active-low option)
+  // Make sure pump is off at startup (respect relay active-low option)
   if (RELAY_ACTIVE_LOW)
     digitalWrite(RELAY_PIN, HIGH);
   else
@@ -1200,7 +1206,7 @@ void setup()
   // LED off initially
   digitalWrite(LED_STATUS_PIN, LOW);
 
-  // Inisialisasi I2C untuk LCD
+  // Initialize I2C for LCD
   Wire.begin(I2C_SDA, I2C_SCL);
   delay(100); // Give I2C bus time to stabilize
 
@@ -1257,16 +1263,16 @@ void setup()
     Serial.println("   Tip: Check wiring (SDA=21, SCL=22, VCC=5V, GND=GND)");
   }
 
-  // Inisialisasi sensor DHT
+  // Initialize DHT sensor
   dht.begin();
 
   // Load WiFi credentials from flash
   loadWiFiCredentials();
 
-  // Koneksi WiFi
+  // Connect to WiFi
   if (savedSSID.length() > 0)
   {
-    Serial.print("🔗 Menghubungkan ke WiFi: ");
+    Serial.print("🔗 Connecting to WiFi: ");
     Serial.println(savedSSID);
 
     WiFi.mode(WIFI_STA);
@@ -1283,10 +1289,10 @@ void setup()
     if (WiFi.status() == WL_CONNECTED)
     {
       isAPMode = false;
-      Serial.println("\n✅ WiFi terhubung!");
+      Serial.println("\n✅ WiFi connected!");
       Serial.print("📡 IP Address: ");
       Serial.println(WiFi.localIP());
-      Serial.println("🌐 Akses web interface di: http://" + WiFi.localIP().toString());
+      Serial.println("🌐 Access web interface at: http://" + WiFi.localIP().toString());
 
       // Display WiFi connected on LCD
       if (lcd)
@@ -1312,7 +1318,7 @@ void setup()
         Serial.println("(lcd) Skipped LCD display: not initialized");
       }
 
-      // Setup mDNS (bisa akses via http://agrohygra.local)
+      // Setup mDNS (can access via http://agrohygra.local)
       if (MDNS.begin("agrohygra"))
       {
         Serial.println("🌐 mDNS started: http://agrohygra.local");
@@ -1320,7 +1326,7 @@ void setup()
     }
     else
     {
-      Serial.println("\n❌ WiFi gagal terhubung! Memulai Access Point mode...");
+      Serial.println("\n❌ WiFi connection failed! Starting Access Point mode...");
       isAPMode = true;
     }
   }
@@ -1330,23 +1336,23 @@ void setup()
     isAPMode = true;
   }
 
-  // Setup sebagai Access Point jika belum connect atau tidak ada credentials
+  // Setup as Access Point if not connected or no credentials
   if (isAPMode)
   {
     WiFi.mode(WIFI_AP);
     const char *ap_ssid = "AgroHygra-Setup";
-    const char *ap_password = "agrohygra123";
 
-    bool apStarted = WiFi.softAP(ap_ssid, ap_password);
+    // Open network (no password) for easy setup access
+    bool apStarted = WiFi.softAP(ap_ssid);
     if (apStarted)
     {
       IPAddress apIP = WiFi.softAPIP();
-      Serial.println("✅ Access Point dimulai untuk konfigurasi WiFi!");
+      Serial.println("✅ Access Point started for WiFi configuration!");
       Serial.println("📡 SSID: " + String(ap_ssid));
-      Serial.println("🔐 Password: " + String(ap_password));
+      // Serial.println("🔐 Password: " + String(ap_password));
       Serial.println("🌐 IP Address: " + apIP.toString());
-      Serial.println("🌐 Akses WiFi setup di: http://" + apIP.toString());
-      Serial.println("   atau http://192.168.4.1");
+      Serial.println("🌐 Access WiFi setup at: http://" + apIP.toString());
+      Serial.println("   or http://192.168.4.1");
 
       // Display AP mode on LCD
       if (lcd)
@@ -1368,7 +1374,7 @@ void setup()
     }
     else
     {
-      Serial.println("❌ Gagal memulai Access Point!");
+      Serial.println("❌ Failed to start Access Point!");
     }
   }
 
@@ -1384,7 +1390,7 @@ void setup()
 
   // Start web server
   server.begin();
-  Serial.println("🌐 Web server dimulai pada port 80");
+  Serial.println("🌐 Web server started on port 80");
 
   // Setup MQTT (only if WiFi connected)
   if (WiFi.status() == WL_CONNECTED)
@@ -1395,39 +1401,37 @@ void setup()
 
   // Print final access instructions
   Serial.println("=====================================");
-  Serial.println("✅ SISTEM SIAP DIGUNAKAN!");
+  Serial.println("✅ SYSTEM READY!");
   if (isAPMode)
   {
     Serial.println("🔧 MODE: WiFi Setup (Access Point)");
-    Serial.println("📱 Hubungkan ke WiFi 'AgroHygra-Setup'");
-    Serial.println("🔐 Password: agrohygra123");
-    Serial.println("📱 Lalu buka browser ke: http://192.168.4.1");
-    Serial.println("   untuk konfigurasi WiFi");
+    Serial.println("📱 Connect to 'AgroHygra-Setup' WiFi (Open Network)");
+    Serial.println("📱 Then open browser to: http://192.168.4.1");
+    Serial.println("   for WiFi configuration");
   }
   else if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println("📱 Buka browser dan kunjungi:");
+    Serial.println("📱 Open browser and visit:");
     Serial.println("   http://" + WiFi.localIP().toString());
-    Serial.println("   atau http://agrohygra.local");
+    Serial.println("   or http://agrohygra.local");
   }
   else
   {
-    Serial.println("📱 Hubungkan ke WiFi 'AgroHygra-Setup'");
-    Serial.println("🔐 Password: agrohygra123");
-    Serial.println("📱 Lalu buka browser ke: http://192.168.4.1");
+    Serial.println("📱 Connect to 'AgroHygra-Setup' WiFi (Open Network)");
+    Serial.println("📱 Then open browser to: http://192.168.4.1");
   }
   Serial.println("=====================================");
 
-  // Baca sensor pertama kali
+  // Read sensors first time
   if (!isAPMode)
   {
     readAllSensors();
 
-    Serial.println("✅ Sistem siap!");
-    Serial.printf("🌾 Kelembapan tanah saat ini: %d%%\n", soilMoisture);
-    Serial.printf("🌡️  Suhu: %.1f°C, Kelembapan udara: %.1f%%\n", temperature, humidity);
-    Serial.printf("🌬️  Kualitas udara: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
-                  airQuality, airQualityRaw, airQualityGood ? "Baik" : "Buruk", (int)calculatePPM(airQualityRaw));
+    Serial.println("✅ System ready!");
+    Serial.printf("🌾 Current soil moisture: %d%%\n", soilMoisture);
+    Serial.printf("🌡️  Temperature: %.1f°C, Air humidity: %.1f%%\n", temperature, humidity);
+    Serial.printf("🌬️  Air quality: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
+                  airQuality, airQualityRaw, airQualityGood ? "Good" : "Poor", (int)calculatePPM(airQualityRaw));
 
     // Display initial sensor readings on LCD
     if (lcd)
@@ -1436,7 +1440,7 @@ void setup()
       lcd->setCursor(0, 0);
       lcd->print("System Ready!");
       lcd->setCursor(0, 1);
-      lcd->print("Tanah:");
+      lcd->print("Soil:");
       lcd->print(soilMoisture);
       lcd->print("% ");
       lcd->print(temperature, 1);
@@ -1451,7 +1455,7 @@ void setup()
   }
   else
   {
-    Serial.println("✅ Sistem dalam mode setup WiFi");
+    Serial.println("✅ System in WiFi setup mode");
   }
   Serial.println("=====================================");
 
@@ -1468,7 +1472,7 @@ void setup()
   // connect directly to the ESP32 ADC. Use a voltage divider to bring 0-5V down to 0-3.3V.
 }
 
-// ========== LOOP UTAMA ==========
+// ========== MAIN LOOP ==========
 void loop()
 {
   // Handle web server
@@ -1488,24 +1492,24 @@ void loop()
     lastWiFiCheck = millis();
     if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED)
     {
-      Serial.println("⚠️  WiFi terputus, mencoba reconnect...");
+      Serial.println("⚠️  WiFi disconnected, attempting reconnect...");
       WiFi.reconnect();
     }
   }
 
-  // Baca sensor secara berkala
+  // Read sensors periodically
   if (millis() - lastSensorRead >= (SENSOR_READ_INTERVAL * 1000UL))
   {
     lastSensorRead = millis();
 
     readAllSensors();
 
-    // Tampilkan data ke Serial Monitor
-    Serial.printf("📊 Tanah: %d%% | Suhu: %.1f°C | RH: %.1f%% | Udara: %d%% | Pompa: %s\n",
+    // Display data to Serial Monitor
+    Serial.printf("📊 Soil: %d%% | Temp: %.1f°C | RH: %.1f%% | Air: %d%% | Pump: %s\n",
                   soilMoisture, temperature, humidity, airQuality,
                   pumpActive ? "ON" : "OFF");
 
-    // Jalankan logika irigasi otomatis
+    // Run auto irrigation logic
     autoIrrigation();
   }
 
@@ -1549,6 +1553,6 @@ void loop()
     updateLCD();
   }
 
-  // Delay kecil untuk stabilitas
+  // Small delay for stability
   delay(100);
 }
