@@ -7,6 +7,8 @@
 #include <PubSubClient.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 // ========== KONFIGURASI WIFI ==========
 // WiFi credentials will be stored in Preferences (non-volatile storage)
@@ -42,8 +44,13 @@ const char *TOPIC_LOGS = "agrohygra/logs";
 //   Use 3.3V to power the sensor when connecting to ESP32. Many breakout boards work with 3.3V.
 // - If your sensor breakout already has a pull-up or other circuitry, that's fine. Avoid powering the sensor
 //   from the ESP32 3.3V if the sensor will drive a heavy load; use a separate 3.3V/5V supply and common GND.
+// - LCD I2C 16x2: VCC -> 5V, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22
+//   Most I2C LCD modules work at 5V. ESP32 I2C pins are 3.3V but usually compatible.
+//   Default I2C address is 0x27 or 0x3F (check your module).
 #define DHT_PIN 4      // Pin sensor suhu/kelembapan udara (DHT11)
 #define DHT_TYPE DHT11 // Jenis sensor DHT
+#define I2C_SDA 21     // Pin I2C SDA untuk LCD (default ESP32)
+#define I2C_SCL 22     // Pin I2C SCL untuk LCD (default ESP32)
 // Recommended analog pins for ESP32 (ADC1): 32, 33, 34, 35, 36, 39
 // Use an ADC1 pin to avoid conflicts with WiFi (ADC2 is shared with WiFi)
 // Use GPIO34 as default for the capacitive soil sensor's AOUT
@@ -90,6 +97,10 @@ DHT dht(DHT_PIN, DHT_TYPE);
 WebServer server(80);
 WiFiClient espClient; // Use regular WiFiClient for non-TLS
 PubSubClient mqttClient(espClient);
+// LCD I2C - alamat default 0x27 (atau 0x3F untuk beberapa modul)
+// Format: LiquidCrystal_I2C(address, columns, rows)
+// Use pointer to allow dynamic instantiation after I2C address scan
+LiquidCrystal_I2C *lcd = nullptr;
 
 unsigned long lastSensorRead = 0;
 bool pumpActive = false;
@@ -119,6 +130,12 @@ const unsigned long MQTT_RECONNECT_INTERVAL = 5000; // Try reconnect every 5 sec
 // WiFi Manager variables
 bool isAPMode = false;
 String scannedNetworks = "";
+
+// LCD display variables
+unsigned long lastLCDUpdate = 0;
+const unsigned long LCD_UPDATE_INTERVAL = 2000; // Update LCD every 2 seconds
+int lcdPage = 0;                                // 0=soil+temp, 1=humidity+air, 2=TDS+pump, 3=wifi+mqtt, 4=ssid+ip
+const int LCD_PAGES = 5;
 
 // ========== FUNGSI WIFI MANAGER ==========
 void saveWiFiCredentials(String ssid, String password)
@@ -289,6 +306,137 @@ void readAllSensors()
   {
     consecutiveDryCount = 0;
   }
+}
+
+// ========== FUNGSI LCD DISPLAY ==========
+void updateLCD()
+{
+  if (!lcd)
+    return; // LCD not initialized
+
+  lcd->clear();
+
+  switch (lcdPage)
+  {
+  case 0: // Soil moisture & Temperature
+    lcd->setCursor(0, 0);
+    lcd->print("Tanah:");
+    lcd->print(soilMoisture);
+    lcd->print("%");
+    if (soilMoisture <= MOISTURE_THRESHOLD)
+    {
+      lcd->print(" DRY");
+    }
+    else if (soilMoisture >= MOISTURE_STOP)
+    {
+      lcd->print(" WET");
+    }
+
+    lcd->setCursor(0, 1);
+    lcd->print("Suhu:");
+    lcd->print(temperature, 1);
+    lcd->print((char)223); // degree symbol
+    lcd->print("C");
+    break;
+
+  case 1: // Humidity & Air Quality
+    lcd->setCursor(0, 0);
+    lcd->print("Kelembapan:");
+    lcd->print(humidity, 1);
+    lcd->print("%");
+
+    lcd->setCursor(0, 1);
+    lcd->print("Udara:");
+    lcd->print(airQuality);
+    lcd->print("% ");
+    lcd->print(airQualityGood ? "OK" : "BAD");
+    break;
+
+  case 2: // TDS & Pump Status
+    lcd->setCursor(0, 0);
+    lcd->print("TDS:");
+    lcd->print(tdsValue);
+    lcd->print(" ppm");
+
+    lcd->setCursor(0, 1);
+    lcd->print("Pompa:");
+    if (pumpActive)
+    {
+      lcd->print("ON ");
+      // Show pump runtime
+      unsigned long pumpTime = (millis() - pumpStartTime) / 1000;
+      lcd->print(pumpTime);
+      lcd->print("s");
+    }
+    else
+    {
+      lcd->print("OFF");
+    }
+    break;
+
+  case 3: // WiFi & MQTT Status
+    lcd->setCursor(0, 0);
+    if (isAPMode)
+    {
+      lcd->print("WiFi:AP Mode");
+    }
+    else if (WiFi.status() == WL_CONNECTED)
+    {
+      lcd->print("WiFi:OK ");
+      lcd->print(WiFi.RSSI());
+      lcd->print("dB");
+    }
+    else
+    {
+      lcd->print("WiFi:Disc");
+    }
+
+    lcd->setCursor(0, 1);
+    lcd->print("MQTT:");
+    lcd->print(mqttClient.connected() ? "ON" : "OFF");
+    lcd->print(" #");
+    lcd->print(wateringCount);
+    break;
+
+  case 4: // SSID & IP Address
+    lcd->setCursor(0, 0);
+    if (isAPMode)
+    {
+      lcd->print("AP:AgroHygra");
+    }
+    else if (WiFi.status() == WL_CONNECTED)
+    {
+      // Display SSID (truncate if too long)
+      String displaySSID = savedSSID;
+      if (displaySSID.length() > 16)
+      {
+        displaySSID = displaySSID.substring(0, 16);
+      }
+      lcd->print(displaySSID);
+    }
+    else
+    {
+      lcd->print("WiFi: No Conn");
+    }
+
+    lcd->setCursor(0, 1);
+    if (isAPMode)
+    {
+      lcd->print("192.168.4.1");
+    }
+    else if (WiFi.status() == WL_CONNECTED)
+    {
+      lcd->print(WiFi.localIP());
+    }
+    else
+    {
+      lcd->print("IP: ---");
+    }
+    break;
+  }
+
+  // Cycle through pages
+  lcdPage = (lcdPage + 1) % LCD_PAGES;
 }
 
 // ========== FUNGSI KONTROL POMPA ==========
@@ -1052,6 +1200,63 @@ void setup()
   // LED off initially
   digitalWrite(LED_STATUS_PIN, LOW);
 
+  // Inisialisasi I2C untuk LCD
+  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(100); // Give I2C bus time to stabilize
+
+  // Try to detect common I2C LCD addresses and instantiate LCD dynamically
+  const uint8_t candidates[] = {0x27, 0x3F};
+  uint8_t foundAddr = 0;
+
+  Serial.println("🔍 Scanning for I2C LCD...");
+  for (uint8_t i = 0; i < sizeof(candidates); i++)
+  {
+    Wire.beginTransmission(candidates[i]);
+    if (Wire.endTransmission() == 0)
+    {
+      foundAddr = candidates[i];
+      Serial.printf("   Found I2C device at 0x%02X\n", foundAddr);
+      break;
+    }
+  }
+
+  if (foundAddr != 0)
+  {
+    Serial.printf("✅ LCD I2C detected at 0x%02X\n", foundAddr);
+
+    // enjoyneering/LiquidCrystal_I2C v1.4.0 constructor
+    // Standard PCF8574 LCD backpack mapping: P0-P7 map to LCD pins 4,5,6,16,11,12,13,14
+    // LiquidCrystal_I2C(address, P0, P1, P2, P3, P4, P5, P6, P7, polarity)
+    lcd = new LiquidCrystal_I2C((pcf8574Address)foundAddr, 4, 5, 6, 16, 11, 12, 13, 14, POSITIVE);
+
+    if (lcd)
+    {
+      // Initialize LCD with columns and rows
+      if (lcd->begin(16, 2) == true)
+      {
+        Serial.println("✅ LCD initialized successfully");
+        // lcd->backlight();
+        lcd->clear();
+        lcd->setCursor(0, 0);
+        lcd->print("  AgroHygra  ");
+        lcd->setCursor(0, 1);
+        lcd->print("  Booting...  ");
+        delay(1500);
+      }
+      else
+      {
+        Serial.println("❌ LCD begin() failed");
+        delete lcd;
+        lcd = nullptr;
+      }
+    }
+  }
+  else
+  {
+    Serial.println("❌ I2C LCD not found at 0x27/0x3F. LCD disabled.");
+    Serial.println("   Tip: Check wiring (SDA=21, SCL=22, VCC=5V, GND=GND)");
+  }
+
   // Inisialisasi sensor DHT
   dht.begin();
 
@@ -1082,6 +1287,30 @@ void setup()
       Serial.print("📡 IP Address: ");
       Serial.println(WiFi.localIP());
       Serial.println("🌐 Akses web interface di: http://" + WiFi.localIP().toString());
+
+      // Display WiFi connected on LCD
+      if (lcd)
+      {
+        lcd->clear();
+        lcd->setCursor(0, 0);
+        lcd->print("WiFi:");
+        // Truncate SSID if too long (max 11 chars after "WiFi:")
+        String shortSSID = savedSSID;
+        if (shortSSID.length() > 11)
+        {
+          shortSSID = shortSSID.substring(0, 11);
+        }
+        lcd->print(shortSSID);
+
+        lcd->setCursor(0, 1);
+        lcd->print("IP:");
+        lcd->print(WiFi.localIP());
+        delay(4000);
+      }
+      else
+      {
+        Serial.println("(lcd) Skipped LCD display: not initialized");
+      }
 
       // Setup mDNS (bisa akses via http://agrohygra.local)
       if (MDNS.begin("agrohygra"))
@@ -1118,6 +1347,21 @@ void setup()
       Serial.println("🌐 IP Address: " + apIP.toString());
       Serial.println("🌐 Akses WiFi setup di: http://" + apIP.toString());
       Serial.println("   atau http://192.168.4.1");
+
+      // Display AP mode on LCD
+      if (lcd)
+      {
+        lcd->clear();
+        lcd->setCursor(0, 0);
+        lcd->print("AP Mode Active");
+        lcd->setCursor(0, 1);
+        lcd->print(apIP);
+        delay(3000);
+      }
+      else
+      {
+        Serial.println("(lcd) Skipped AP LCD display: not initialized");
+      }
 
       // Scan networks on startup for AP mode
       scannedNetworks = scanWiFiNetworks();
@@ -1184,6 +1428,26 @@ void setup()
     Serial.printf("🌡️  Suhu: %.1f°C, Kelembapan udara: %.1f%%\n", temperature, humidity);
     Serial.printf("🌬️  Kualitas udara: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
                   airQuality, airQualityRaw, airQualityGood ? "Baik" : "Buruk", (int)calculatePPM(airQualityRaw));
+
+    // Display initial sensor readings on LCD
+    if (lcd)
+    {
+      lcd->clear();
+      lcd->setCursor(0, 0);
+      lcd->print("System Ready!");
+      lcd->setCursor(0, 1);
+      lcd->print("Tanah:");
+      lcd->print(soilMoisture);
+      lcd->print("% ");
+      lcd->print(temperature, 1);
+      lcd->print((char)223);
+      lcd->print("C");
+      delay(2000);
+    }
+    else
+    {
+      Serial.println("(lcd) Skipped initial sensor LCD display: not initialized");
+    }
   }
   else
   {
@@ -1277,6 +1541,13 @@ void loop()
 
   // Update status LED
   updateStatusLED();
+
+  // Update LCD display periodically
+  if (millis() - lastLCDUpdate >= LCD_UPDATE_INTERVAL)
+  {
+    lastLCDUpdate = millis();
+    updateLCD();
+  }
 
   // Delay kecil untuk stabilitas
   delay(100);
