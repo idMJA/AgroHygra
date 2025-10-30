@@ -47,14 +47,26 @@ const char *TOPIC_LOGS = "agrohygra/logs";
 // - LCD I2C 16x2: VCC -> 5V, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22
 //   Most I2C LCD modules work at 5V. ESP32 I2C pins are 3.3V but usually compatible.
 //   Default I2C address is 0x27 or 0x3F (check your module).
+// - RS485 NPK Sensor 7-in-1 (Soil N-P-K-pH-EC-Temp-Humidity):
+//   Left pins: VCC -> 5V, GND -> GND, A -> RS485 A, B -> RS485 B
+//   Right pins: DI -> TX2 (GPIO17), RO -> RX2 (GPIO16), DE+RE -> GPIO23
 #define DHT_PIN 4      // Temperature/humidity sensor pin (DHT11)
 #define DHT_TYPE DHT11 // DHT sensor type
 #define I2C_SDA 21     // I2C SDA pin for LCD (default ESP32)
 #define I2C_SCL 22     // I2C SCL pin for LCD (default ESP32)
+
+// RS485 NPK Sensor 7-in-1 pins
+#define RS485_RX 16    // RO (Receiver Output) from sensor to ESP32 RX2
+#define RS485_TX 17    // DI (Driver Input) from ESP32 TX2 to sensor
+#define RS485_DE_RE 23 // DE (Driver Enable) and RE (Receiver Enable) tied together
+// Note: Connect both DE and RE pins of the sensor to GPIO 23
+// When HIGH: transmit mode (ESP32 sends data to sensor)
+// When LOW: receive mode (ESP32 receives data from sensor)
+
 // Recommended analog pins for ESP32 (ADC1): 32, 33, 34, 35, 36, 39
 // Use an ADC1 pin to avoid conflicts with WiFi (ADC2 is shared with WiFi)
-// Use GPIO34 as default for the capacitive soil sensor's AOUT
-#define SOIL_PIN 34 // Analog pin for capacitive soil moisture sensor (AOUT -> this pin)
+// NOTE: Capacitive soil sensor REMOVED - using NPK sensor's built-in soil moisture instead
+// #define SOIL_PIN 34 // [REMOVED] Analog pin for capacitive soil moisture sensor
 // MQ-135 air quality sensor wiring: VCC -> 5V or 3.3V, GND -> GND, AO -> analog pin, DO -> digital pin (optional)
 // AO gives analog reading (0-4095 on ESP32), DO gives digital threshold output (HIGH/LOW based on onboard potentiometer)
 // Use ADC1 pins to avoid WiFi conflicts. For digital pin, use any available GPIO.
@@ -71,12 +83,27 @@ const char *TOPIC_LOGS = "agrohygra/logs";
 #define LED_STATUS_PIN 2 // Built-in ESP32 LED pin for status indicator
 
 // ========== SENSOR & SYSTEM CONFIGURATION ==========
-const int SOIL_DRY_VALUE = 3000;    // ADC value when soil is dry (calibration)
-const int SOIL_WET_VALUE = 1000;    // ADC value when soil is wet (calibration)
+// Note: Capacitive soil sensor removed - using NPK sensor's built-in soil moisture
+// const int SOIL_DRY_VALUE = 3000; // [REMOVED] ADC value when soil is dry (calibration)
+// const int SOIL_WET_VALUE = 1000; // [REMOVED] ADC value when soil is wet (calibration)
 const int MOISTURE_THRESHOLD = 30;  // Moisture threshold to start irrigation (%)
 const int MOISTURE_STOP = 70;       // Moisture threshold to stop irrigation (%)
 const int MAX_PUMP_TIME = 60;       // Maximum pump run time (seconds) for safety
 const int SENSOR_READ_INTERVAL = 2; // Sensor reading interval (seconds)
+
+// RS485 NPK Sensor Configuration
+const byte NPK_SENSOR_ADDRESS = 0x01;            // Default Modbus address (check sensor documentation)
+const long NPK_BAUD_RATE = 4800;                 // Baud rate 4800 (standard for this sensor)
+const byte MODBUS_READ_HOLDING_REGISTERS = 0x03; // Modbus function code
+
+// NPK Sensor Register Addresses (from sensor documentation)
+const uint16_t MOISTURE_REGISTER = 0x0000;     // Register 40001 - Moisture content (0.1% resolution)
+const uint16_t TEMPERATURE_REGISTER = 0x0001;  // Register 40002 - Temperature value (0.1°C resolution)
+const uint16_t CONDUCTIVITY_REGISTER = 0x0002; // Register 40003 - Electrical conductivity (uS/cm)
+const uint16_t PH_REGISTER = 0x0003;           // Register 40004 - PH value (0.1 resolution)
+const uint16_t NITROGEN_REGISTER = 0x0004;     // Register 40005 - Nitrogen content (mg/kg)
+const uint16_t PHOSPHORUS_REGISTER = 0x0005;   // Register 40006 - Phosphorus content (mg/kg)
+const uint16_t POTASSIUM_REGISTER = 0x0006;    // Register 40007 - Potassium content (mg/kg)
 
 // Safety: do not auto-start pump immediately after boot. Require a short delay
 // and require multiple consecutive "dry" readings to avoid false positives.
@@ -102,6 +129,9 @@ PubSubClient mqttClient(espClient);
 // Use pointer to allow dynamic instantiation after I2C address scan
 LiquidCrystal_I2C *lcd = nullptr;
 
+// RS485 Serial Port (use Serial2 on ESP32)
+HardwareSerial RS485Serial(2); // UART2 on ESP32
+
 unsigned long lastSensorRead = 0;
 bool pumpActive = false;
 unsigned long pumpStartTime = 0;
@@ -115,6 +145,16 @@ bool airQualityGood = true; // Digital threshold status from DO pin
 // TDS sensor
 int tdsRaw = 0;   // raw ADC reading from TDS A pin
 int tdsValue = 0; // estimated TDS (ppm) - requires calibration
+
+// RS485 NPK Sensor 7-in-1 data
+float npk_nitrogen = 0.0;          // N content (mg/kg)
+float npk_phosphorus = 0.0;        // P content (mg/kg)
+float npk_potassium = 0.0;         // K content (mg/kg)
+float npk_ph = 0.0;                // pH value (0-14)
+float npk_ec = 0.0;                // EC value (mS/cm)
+float npk_temperature = 0.0;       // Soil temperature (°C)
+float npk_humidity = 0.0;          // Soil moisture/humidity (%)
+bool npk_sensor_available = false; // Sensor connection status
 
 // Statistik sistem
 unsigned long totalWateringTime = 0;
@@ -136,6 +176,10 @@ unsigned long lastLCDUpdate = 0;
 const unsigned long LCD_UPDATE_INTERVAL = 2000; // Update LCD every 2 seconds
 int lcdPage = 0;                                // 0=soil+temp, 1=humidity+air, 2=TDS+pump, 3=wifi+mqtt, 4=ssid+ip
 const int LCD_PAGES = 5;
+
+// NPK sensor reading variables
+unsigned long lastNPKRead = 0;
+const unsigned long NPK_READ_INTERVAL = 1000; // Read NPK sensor every 1 second
 
 // ========== WIFI MANAGER FUNCTIONS ==========
 void saveWiFiCredentials(String ssid, String password)
@@ -203,22 +247,204 @@ String scanWiFiNetworks()
 // ========== SENSOR FUNCTIONS ==========
 int readSoilMoisture()
 {
-  // Read multiple samples and average for stability
-  const int samples = 10;
-  long sum = 0;
-  for (int i = 0; i < samples; i++)
+  // Use NPK sensor's built-in soil moisture reading
+  // NPK humidity value is already in percentage (0-100%)
+  // Return npk_humidity as soil moisture, or 0 if sensor not available
+  if (npk_sensor_available && npk_humidity >= 0)
   {
-    sum += analogRead(SOIL_PIN);
-    delay(10);
+    return (int)npk_humidity; // Convert float to int
   }
-  int rawValue = sum / samples;
+  else
+  {
+    // If NPK sensor not available, return 0 (dry)
+    return 0;
+  }
+}
 
-  // ADC on ESP32 returns 0-4095 (12-bit) for default resolution; adjust SOIL_DRY/WET values accordingly
-  // Convert to percentage (0-100%)
-  int moisture = map(rawValue, SOIL_DRY_VALUE, SOIL_WET_VALUE, 0, 100);
-  moisture = constrain(moisture, 0, 100); // Limit value to 0-100%
+// ========== RS485 NPK SENSOR FUNCTIONS ==========
+// Calculate Modbus CRC16 (standard Modbus CRC)
+uint16_t calculateCRC16(uint8_t *data, uint8_t length)
+{
+  uint16_t crc = 0xFFFF;
+  for (uint8_t pos = 0; pos < length; pos++)
+  {
+    crc ^= (uint16_t)data[pos];
+    for (uint8_t i = 8; i != 0; i--)
+    {
+      if ((crc & 0x0001) != 0)
+      {
+        crc >>= 1;
+        crc ^= 0xA001;
+      }
+      else
+      {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
 
-  return moisture;
+// Create Modbus request frame
+void createNPKRequestFrame(uint8_t *frame, uint8_t deviceAddress, uint8_t functionCode,
+                           uint16_t registerAddress, uint16_t registerCount)
+{
+  frame[0] = deviceAddress;                 // Device address
+  frame[1] = functionCode;                  // Function code
+  frame[2] = (registerAddress >> 8) & 0xFF; // High byte of register address
+  frame[3] = registerAddress & 0xFF;        // Low byte of register address
+  frame[4] = (registerCount >> 8) & 0xFF;   // High byte of register count
+  frame[5] = registerCount & 0xFF;          // Low byte of register count
+
+  // Calculate CRC
+  uint16_t crc = calculateCRC16(frame, 6);
+  frame[6] = crc & 0xFF;        // Low byte of CRC (important: low byte first!)
+  frame[7] = (crc >> 8) & 0xFF; // High byte of CRC
+}
+
+// Read single register from NPK sensor (more reliable than batch read)
+uint16_t readNPKRegister(uint16_t registerAddress)
+{
+  uint8_t requestFrame[8];
+  uint8_t responseFrame[9];
+  uint16_t value = 0;
+
+  // Clear serial buffer
+  while (RS485Serial.available())
+  {
+    RS485Serial.read();
+  }
+
+  // Create the request frame (read 1 register)
+  createNPKRequestFrame(requestFrame, NPK_SENSOR_ADDRESS, MODBUS_READ_HOLDING_REGISTERS,
+                        registerAddress, 1);
+
+  // Set to transmit mode (DE/RE HIGH)
+  digitalWrite(RS485_DE_RE, HIGH);
+  delay(10);
+
+  // Send request
+  RS485Serial.write(requestFrame, sizeof(requestFrame));
+  RS485Serial.flush(); // Wait for transmission complete
+
+  // Set to receive mode (DE/RE LOW)
+  digitalWrite(RS485_DE_RE, LOW);
+  delay(10);
+
+  // Wait for and read response (timeout 1000ms)
+  unsigned long startTime = millis();
+  uint8_t index = 0;
+
+  while (millis() - startTime < 1000 && index < sizeof(responseFrame))
+  {
+    if (RS485Serial.available())
+    {
+      responseFrame[index++] = RS485Serial.read();
+    }
+  }
+
+  // Check if we received a complete response (minimum 7 bytes: addr + func + count + 2data + 2crc)
+  if (index >= 7)
+  {
+    // Verify CRC (CRC is at end: low byte then high byte)
+    uint16_t receivedCRC = (responseFrame[index - 1] << 8) | responseFrame[index - 2];
+    uint16_t calculatedCRC = calculateCRC16(responseFrame, index - 2);
+
+    if (receivedCRC == calculatedCRC && responseFrame[1] == MODBUS_READ_HOLDING_REGISTERS)
+    {
+      // Extract the value (big-endian format)
+      value = (responseFrame[3] << 8) | responseFrame[4];
+      return value;
+    }
+    else
+    {
+      Serial.printf("❌ NPK Reg 0x%04X: CRC error (recv:0x%04X calc:0x%04X)\n",
+                    registerAddress, receivedCRC, calculatedCRC);
+      return 0xFFFF; // Return error value
+    }
+  }
+  else
+  {
+    Serial.printf("❌ NPK Reg 0x%04X: Timeout (%d bytes)\n", registerAddress, index);
+    return 0xFFFF; // Return error value
+  }
+}
+
+// Read all NPK sensor data (reads each register individually for reliability)
+bool readNPKSensor()
+{
+  // Read all 7 registers one by one (more reliable than batch read)
+  uint16_t moisture_raw = readNPKRegister(MOISTURE_REGISTER);
+  delay(50); // Small delay between reads (reduced to 50ms for faster update)
+
+  uint16_t temperature_raw = readNPKRegister(TEMPERATURE_REGISTER);
+  delay(50);
+
+  uint16_t conductivity_raw = readNPKRegister(CONDUCTIVITY_REGISTER);
+  delay(50);
+
+  uint16_t ph_raw = readNPKRegister(PH_REGISTER);
+  delay(50);
+
+  uint16_t nitrogen_raw = readNPKRegister(NITROGEN_REGISTER);
+  delay(50);
+
+  uint16_t phosphorus_raw = readNPKRegister(PHOSPHORUS_REGISTER);
+  delay(50);
+
+  uint16_t potassium_raw = readNPKRegister(POTASSIUM_REGISTER);
+  delay(50);
+
+  // Check if at least some readings are valid (not all 0xFFFF)
+  int validReadings = 0;
+  if (moisture_raw != 0xFFFF)
+    validReadings++;
+  if (temperature_raw != 0xFFFF)
+    validReadings++;
+  if (conductivity_raw != 0xFFFF)
+    validReadings++;
+  if (ph_raw != 0xFFFF)
+    validReadings++;
+  if (nitrogen_raw != 0xFFFF)
+    validReadings++;
+  if (phosphorus_raw != 0xFFFF)
+    validReadings++;
+  if (potassium_raw != 0xFFFF)
+    validReadings++;
+
+  if (validReadings >= 4) // At least 4 out of 7 readings must be valid
+  {
+    // Convert raw values to actual measurements
+    npk_humidity = (moisture_raw != 0xFFFF) ? moisture_raw / 10.0 : -1.0;
+    npk_temperature = (temperature_raw != 0xFFFF) ? temperature_raw / 10.0 : -100.0;
+    npk_ec = (conductivity_raw != 0xFFFF) ? conductivity_raw / 1000.0 : -1.0; // Convert uS/cm to mS/cm
+    npk_ph = (ph_raw != 0xFFFF) ? ph_raw / 10.0 : -1.0;
+    npk_nitrogen = (nitrogen_raw != 0xFFFF) ? nitrogen_raw : 0;
+    npk_phosphorus = (phosphorus_raw != 0xFFFF) ? phosphorus_raw : 0;
+    npk_potassium = (potassium_raw != 0xFFFF) ? potassium_raw : 0;
+
+    npk_sensor_available = true;
+
+    Serial.println("=== 7-in-1 NPK Sensor Readings ===");
+    Serial.printf("Moisture: %.1f%%\n", npk_humidity);
+    Serial.printf("Temperature: %.1f°C\n", npk_temperature);
+    Serial.printf("Conductivity: %.0f uS/cm (%.3f mS/cm)\n", conductivity_raw * 1.0, npk_ec);
+    Serial.printf("pH: %.1f\n", npk_ph);
+    Serial.printf("Nitrogen (N): %.0f mg/kg\n", npk_nitrogen);
+    Serial.printf("Phosphorus (P): %.0f mg/kg\n", npk_phosphorus);
+    Serial.printf("Potassium (K): %.0f mg/kg\n", npk_potassium);
+    Serial.printf("Valid readings: %d/7\n", validReadings);
+    Serial.println("==================================");
+
+    return true;
+  }
+  else
+  {
+    npk_sensor_available = false;
+    Serial.printf("❌ NPK sensor failed (only %d/7 valid readings)\n", validReadings);
+    Serial.println("   Check: wiring, baud rate (4800), address (0x01)");
+    return false;
+  }
 }
 
 // ========== MQ-135 AIR QUALITY FUNCTIONS ==========
@@ -264,6 +490,9 @@ void readAllSensors()
   soilMoisture = readSoilMoisture();
   temperature = dht.readTemperature();
   humidity = dht.readHumidity();
+
+  // NPK Sensor will be read separately in main loop (every 1 second)
+  // to avoid blocking other sensors
 
   // Read TDS sensor
   {
@@ -605,6 +834,17 @@ void publishSensorData()
   // TDS short fields
   sensorDoc["tdsRaw"] = tdsRaw;
   sensorDoc["tds"] = tdsValue; // ppm (approx)
+  // NPK Sensor data
+  if (npk_sensor_available)
+  {
+    sensorDoc["npk"]["n"] = npk_nitrogen;
+    sensorDoc["npk"]["p"] = npk_phosphorus;
+    sensorDoc["npk"]["k"] = npk_potassium;
+    sensorDoc["npk"]["ph"] = npk_ph;
+    sensorDoc["npk"]["ec"] = npk_ec;
+    sensorDoc["npk"]["soilTemp"] = npk_temperature;
+    sensorDoc["npk"]["soilMoist"] = npk_humidity;
+  }
 
   String sensorPayload;
   serializeJson(sensorDoc, sensorPayload);
@@ -765,6 +1005,20 @@ void handleRoot()
                     document.getElementById('airQualityStatus').textContent = 'Status: ' + (data.airQualityGood ? '🟢 Good' : '🔴 Poor') + ' | ~' + data.airQualityPPM + ' ppm';
                     document.getElementById('tdsValue').textContent = data.tdsValuePPM + ' ppm | ' + data.tdsRaw + ' ADC';
                     
+                    // Update NPK sensor data if available
+                    if (data.npkSensor && data.npkSensor.available) {
+                        document.getElementById('npkCard').style.display = 'block';
+                        document.getElementById('npkNitrogen').textContent = data.npkSensor.nitrogen.toFixed(0);
+                        document.getElementById('npkPhosphorus').textContent = data.npkSensor.phosphorus.toFixed(0);
+                        document.getElementById('npkPotassium').textContent = data.npkSensor.potassium.toFixed(0);
+                        document.getElementById('npkPh').textContent = data.npkSensor.ph.toFixed(1);
+                        document.getElementById('npkEc').textContent = data.npkSensor.ec.toFixed(3);
+                        document.getElementById('npkSoilTemp').textContent = data.npkSensor.soilTemperature.toFixed(1);
+                        document.getElementById('npkSoilMoist').textContent = data.npkSensor.soilMoisture.toFixed(1);
+                    } else {
+                        document.getElementById('npkCard').style.display = 'none';
+                    }
+                    
                     // Update pump status
                     const pumpStatus = document.getElementById('pumpStatus');
                     const isPumpOn = data.pumpActive;
@@ -848,6 +1102,40 @@ void handleRoot()
             <div class="sensor-label">TDS Meter</div>
             <div class="sensor-value" id="tdsValue">--</div>
             <div class="sensor-label">Note: approximate, calibrate for accurate readings</div>
+        </div>
+        
+        <div class="sensor-card" id="npkCard" style="display:none;">
+            <div class="sensor-label">🌾 NPK Sensor 7-in-1 (RS485)</div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+                <div>
+                    <div class="sensor-label">Nitrogen (N)</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkNitrogen">--</span> mg/kg</div>
+                </div>
+                <div>
+                    <div class="sensor-label">Phosphorus (P)</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkPhosphorus">--</span> mg/kg</div>
+                </div>
+                <div>
+                    <div class="sensor-label">Potassium (K)</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkPotassium">--</span> mg/kg</div>
+                </div>
+                <div>
+                    <div class="sensor-label">pH Level</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkPh">--</span></div>
+                </div>
+                <div>
+                    <div class="sensor-label">EC (Conductivity)</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkEc">--</span> mS/cm</div>
+                </div>
+                <div>
+                    <div class="sensor-label">Soil Temp</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkSoilTemp">--</span>°C</div>
+                </div>
+                <div style="grid-column: 1 / -1;">
+                    <div class="sensor-label">Soil Moisture (NPK)</div>
+                    <div class="sensor-value" style="font-size: 18px;"><span id="npkSoilMoist">--</span>%</div>
+                </div>
+            </div>
         </div>
         
         <div class="status off" id="pumpStatus">
@@ -1158,6 +1446,23 @@ void handleAPI()
   json["mqttTopics"]["pumpStatus"] = TOPIC_PUMP_STATUS;
   json["mqttTopics"]["systemStatus"] = TOPIC_SYSTEM_STATUS;
 
+  // NPK Sensor data
+  if (npk_sensor_available)
+  {
+    json["npkSensor"]["available"] = true;
+    json["npkSensor"]["nitrogen"] = npk_nitrogen;
+    json["npkSensor"]["phosphorus"] = npk_phosphorus;
+    json["npkSensor"]["potassium"] = npk_potassium;
+    json["npkSensor"]["ph"] = npk_ph;
+    json["npkSensor"]["ec"] = npk_ec;
+    json["npkSensor"]["soilTemperature"] = npk_temperature;
+    json["npkSensor"]["soilMoisture"] = npk_humidity;
+  }
+  else
+  {
+    json["npkSensor"]["available"] = false;
+  }
+
   String response;
   serializeJson(json, response);
 
@@ -1197,7 +1502,10 @@ void setup()
   // Setup pin
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_STATUS_PIN, OUTPUT);
-  pinMode(MQ135_DO_PIN, INPUT); // MQ-135 digital output pin
+  pinMode(MQ135_DO_PIN, INPUT);   // MQ-135 digital output pin
+  pinMode(RS485_DE_RE, OUTPUT);   // RS485 DE/RE control pin
+  digitalWrite(RS485_DE_RE, LOW); // Set to receive mode initially
+
   // Make sure pump is off at startup (respect relay active-low option)
   if (RELAY_ACTIVE_LOW)
     digitalWrite(RELAY_PIN, HIGH);
@@ -1205,6 +1513,12 @@ void setup()
     digitalWrite(RELAY_PIN, LOW);
   // LED off initially
   digitalWrite(LED_STATUS_PIN, LOW);
+
+  // Initialize RS485 Serial for NPK Sensor
+  RS485Serial.begin(NPK_BAUD_RATE, SERIAL_8N1, RS485_RX, RS485_TX);
+  Serial.println("🔧 RS485 Serial initialized for NPK Sensor");
+  Serial.printf("   RX: GPIO%d, TX: GPIO%d, DE/RE: GPIO%d\n", RS485_RX, RS485_TX, RS485_DE_RE);
+  Serial.printf("   Baud Rate: %ld, Address: 0x%02X\n", NPK_BAUD_RATE, NPK_SENSOR_ADDRESS);
 
   // Initialize I2C for LCD
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1428,10 +1742,25 @@ void setup()
     readAllSensors();
 
     Serial.println("✅ System ready!");
-    Serial.printf("🌾 Current soil moisture: %d%%\n", soilMoisture);
-    Serial.printf("🌡️  Temperature: %.1f°C, Air humidity: %.1f%%\n", temperature, humidity);
+    Serial.printf("🌾 Soil moisture (from NPK sensor): %d%%\n", soilMoisture);
+    Serial.printf("🌡️  Air Temperature: %.1f°C, Air humidity: %.1f%%\n", temperature, humidity);
     Serial.printf("🌬️  Air quality: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
                   airQuality, airQualityRaw, airQualityGood ? "Good" : "Poor", (int)calculatePPM(airQualityRaw));
+
+    // Test NPK sensor connection
+    Serial.println("🔍 Testing NPK Sensor connection...");
+    if (readNPKSensor())
+    {
+      Serial.println("✅ NPK Sensor connected and working!");
+      Serial.println("   Note: Soil moisture data from NPK sensor is now used for irrigation");
+    }
+    else
+    {
+      Serial.println("⚠️  NPK Sensor not detected - check wiring and address");
+      Serial.println("   Expected: RX=GPIO16, TX=GPIO17, DE/RE=GPIO23");
+      Serial.println("   Power: VCC=5V, GND=GND, A/B=RS485 line");
+      Serial.println("   WARNING: Soil moisture will be 0% until NPK sensor connects!");
+    }
 
     // Display initial sensor readings on LCD
     if (lcd)
@@ -1459,11 +1788,11 @@ void setup()
   }
   Serial.println("=====================================");
 
-  // Configure ADC for soil sensor and MQ-135 (ESP32)
-  // ADC1 channel pins (32-39, but 34 is input-only and suitable for analog)
+  // Configure ADC for MQ-135 and TDS (ESP32)
+  // ADC1 channel pins (32-39) for analog sensors
   analogReadResolution(12); // 12-bit resolution (0-4095)
   // Set attenuation to allow reading full range with sensor values (0-3.3V)
-  analogSetPinAttenuation(SOIL_PIN, ADC_11db);
+  // Note: Capacitive soil sensor removed - using NPK sensor's soil moisture
   analogSetPinAttenuation(MQ135_AO_PIN, ADC_11db);
   // Configure TDS pin attenuation (use ADC1 pin to avoid WiFi conflicts)
   analogSetPinAttenuation(TDS_PIN, ADC_11db);
@@ -1495,6 +1824,13 @@ void loop()
       Serial.println("⚠️  WiFi disconnected, attempting reconnect...");
       WiFi.reconnect();
     }
+  }
+
+  // Read NPK sensor every 1 second (separate from other sensors)
+  if (millis() - lastNPKRead >= NPK_READ_INTERVAL)
+  {
+    lastNPKRead = millis();
+    readNPKSensor();
   }
 
   // Read sensors periodically

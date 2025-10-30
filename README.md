@@ -20,7 +20,10 @@ An intelligent ESP32-based irrigation system for automatic monitoring and contro
 
 ### Sensors
 - **DHT22** - Air temperature and humidity sensor
-- **Soil Moisture Sensor** - Soil moisture sensor (resistive or capacitive)
+- **MQ-135** - Air quality sensor (CO2, NH3, NOx)
+- **TDS Meter** - Water quality sensor (Total Dissolved Solids)
+- **RS485 NPK Sensor 7-in-1** - Professional soil sensor (N-P-K-pH-EC-Temperature-Moisture)
+  - Note: This sensor provides soil moisture reading, replacing standalone capacitive sensor
 
 ### Actuators & Outputs
 - **Relay Module 5V** - For water pump control
@@ -38,12 +41,13 @@ An intelligent ESP32-based irrigation system for automatic monitoring and contro
 ESP32 Pin    →    Component
 =========================================
 GPIO 4       →    DHT22 Data Pin
-GPIO 34      →    Soil Sensor Analog Out
 GPIO 27      →    Relay IN (Pump)
 GPIO 2       →    LED Status (built-in)
-3.3V         →    DHT22 VCC, Soil Sensor VCC
-GND          →    DHT22 GND, Soil Sensor GND
+3.3V         →    DHT22 VCC
+GND          →    DHT22 GND, Relay GND
 5V           →    Relay VCC
+
+Note: Capacitive soil sensor removed - using NPK sensor's built-in soil moisture
 
 Relay        →    Water Pump
 =========================================
@@ -72,24 +76,19 @@ OPTIONAL: Add 4.7kΩ pull-up resistor between DATA (GPIO 4) and 3.3V
 - Keep data line short to avoid noise
 - Add 4.7kΩ pull-up resistor on data line if sensor is far from ESP32
 
-#### 2. Capacitive Soil Moisture Sensor
+#### 2. Capacitive Soil Moisture Sensor [REMOVED]
 ```
-Soil Sensor Pin  →    ESP32 Pin / Component
-================================================
-VCC              →    3.3V (Power Supply)
-GND              →    GND (Ground)
-AOUT             →    GPIO 34 (Analog Input)
-DOUT (optional)  →    GPIO 32 (Digital Output - optional)
+THIS SENSOR HAS BEEN REMOVED FROM THE SYSTEM
 
-Note: Connect AOUT to ADC1 pin (32-39) to avoid WiFi conflicts
+Reason: The RS485 NPK Sensor 7-in-1 already includes soil moisture measurement
+        which is more accurate and integrated with other soil parameters.
+
+The system now uses NPK sensor's built-in soil moisture (npk_humidity) for
+irrigation control instead of the standalone capacitive sensor.
+
+If you want to use a standalone sensor, you can re-enable GPIO 34 and modify
+the readSoilMoisture() function in main.cpp.
 ```
-
-**Wiring Notes:**
-- Use 3.3V power supply (some modules can handle 5V)
-- AOUT provides analog reading (0-4095)
-- DOUT provides digital threshold output (HIGH/LOW)
-- Avoid ADC2 pins (12, 13, 14, 15, 25, 26, 27) - used by WiFi
-- Add ceramic capacitor (0.1μF) near sensor for noise filtering
 
 #### 3. MQ-135 Air Quality Sensor
 ```
@@ -215,6 +214,48 @@ Cathode (-)     →    GND
 - LED blinks fast (250ms) when pump is active
 - LED steady on during normal operation
 
+#### 9. RS485 NPK Sensor 7-in-1 (Soil N-P-K-pH-EC-Temperature-Moisture)
+```
+NPK Sensor Pin   →    ESP32 Pin / Component
+================================================
+LEFT SIDE (Power & RS485 Line):
+VCC              →    5V (Power Supply)
+B                →    RS485 B line (if daisy-chaining)
+A                →    RS485 A line (if daisy-chaining)
+GND              →    GND (Ground)
+
+RIGHT SIDE (UART Communication):
+DI (Driver In)   →    GPIO 17 (TX2 - UART2 Transmit)
+DE (Driver En)   →    GPIO 23 (Direction Control)
+RE (Receiver En) →    GPIO 23 (Direction Control - tied with DE)
+RO (Receiver Out)→    GPIO 16 (RX2 - UART2 Receive)
+
+Communication Protocol: Modbus RTU via RS485
+Default Baud Rate: 9600 (check sensor manual)
+Default Address: 0x01 (check sensor manual)
+```
+
+**Wiring Notes:**
+- Sensor requires 5V power supply (NOT 3.3V)
+- DE and RE pins MUST be connected together to GPIO 23
+- When GPIO 23 = HIGH: transmit mode (ESP32 sends commands)
+- When GPIO 23 = LOW: receive mode (ESP32 receives data)
+- A and B pins are for RS485 bus (for daisy-chaining multiple sensors)
+- Built-in RS485 transceiver - no external module needed
+- Use twisted pair cable for long distance (up to 100m)
+- Add 120Ω termination resistor between A-B for long cables
+
+**Sensor Measures:**
+- **Nitrogen (N)** - 0-1999 mg/kg (soil nitrogen content)
+- **Phosphorus (P)** - 0-1999 mg/kg (soil phosphorus content)
+- **Potassium (K)** - 0-1999 mg/kg (soil potassium content)
+- **pH** - 0-14 (soil acidity/alkalinity)
+- **EC** - 0-20 mS/cm (electrical conductivity)
+- **Soil Temperature** - -40 to 80°C
+- **Soil Moisture** - 0-100%
+
+**Important:** See [NPK_SENSOR_GUIDE.md](NPK_SENSOR_GUIDE.md) for detailed setup, calibration, and troubleshooting.
+
 ### Complete System Wiring Schematic
 
 ```
@@ -290,12 +331,15 @@ Cathode (-)     →    GND
 | GPIO 4 | DHT22 Data | Digital I/O | 3.3V | Temperature/Humidity sensor |
 | GPIO 21 | I2C SDA | Digital I/O | 3.3V | LCD communication |
 | GPIO 22 | I2C SCL | Digital I/O | 3.3V | LCD communication |
-| GPIO 34 | Soil Moisture ADC | Analog In | 0-3.3V | Capacitive soil sensor |
+| ~~GPIO 34~~ | ~~Soil Moisture ADC~~ | ~~Analog In~~ | ~~0-3.3V~~ | **REMOVED** - Using NPK sensor |
 | GPIO 35 | MQ135 Air Quality ADC | Analog In | 0-3.3V | Air quality sensor |
 | GPIO 32 | MQ135 Digital Out | Digital In | 3.3V | Optional digital threshold |
 | GPIO 33 | TDS Meter ADC | Analog In | 0-3.3V | Water quality sensor |
 | GPIO 27 | Relay Control | Digital Out | 3.3V | Pump relay control (active-low) |
 | GPIO 2 | LED Status | Digital Out | 3.3V | Status indicator LED |
+| GPIO 16 | RS485 RX (RO) | Digital In | 3.3V | NPK sensor receiver output |
+| GPIO 17 | RS485 TX (DI) | Digital Out | 3.3V | NPK sensor driver input |
+| GPIO 23 | RS485 DE/RE | Digital Out | 3.3V | NPK sensor direction control |
 | 3.3V | Power | Output | 3.3V | For sensors (max 500mA) |
 | 5V | Power | Output | 5V | For relay and LCD |
 | GND | Ground | - | 0V | Common ground |
