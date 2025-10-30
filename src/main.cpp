@@ -1,1894 +1,274 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <ArduinoJson.h>
-#include "DHT.h"
-#include <PubSubClient.h>
-#include <WiFiClientSecure.h>
-#include <Preferences.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 
-// ========== WIFI CONFIGURATION ==========
-// WiFi credentials will be stored in Preferences (non-volatile storage)
-// User can configure via web portal when in AP mode
-String savedSSID = "";
-String savedPassword = "";
-Preferences preferences;
+// Configuration
+#include "config/Config.h"
 
-// ========== MQTT CONFIGURATION ==========
-// Public MQTT broker for testing (no authentication required)
-// For production, use HiveMQ Cloud with TLS and authentication
-const char *MQTT_HOST = "broker.hivemq.com";    // Free public broker
-const int MQTT_PORT = 1883;                     // Non-TLS port for testing
-const char *MQTT_USERNAME = "";                 // No username for public broker
-const char *MQTT_PASSWORD = "";                 // No password for public broker
-const char *MQTT_CLIENT_ID = "AgroHygra-ESP32"; // Unique client ID
+// Sensors
+#include "sensors/DHTSensor.h"
+#include "sensors/NPKSensor.h"
+#include "sensors/MQ135Sensor.h"
+#include "sensors/TDSSensor.h"
 
-// MQTT Topics
-const char *TOPIC_SENSORS = "agrohygra/sensors";
-const char *TOPIC_PUMP_COMMAND = "agrohygra/pump/command";
-const char *TOPIC_PUMP_STATUS = "agrohygra/pump/status";
-const char *TOPIC_SYSTEM_STATUS = "agrohygra/system/status";
-const char *TOPIC_LOGS = "agrohygra/logs";
+// Controllers
+#include "controllers/PumpController.h"
 
-// Alternative free MQTT brokers:
-// - broker.hivemq.com:1883 (public, no auth, no TLS)
-// - test.mosquitto.org:1883 (public, no auth, no TLS)
-// For production, use TLS + authentication (HiveMQ Cloud, CloudMQTT, AWS IoT, etc.)
+// Display
+#include "display/LCDDisplay.h"
 
-// ========== PIN CONFIGURATION ==========
-// Wiring notes:
-// - Capacitive soil moisture sensor: VCC -> 3.3V, GND -> GND, AOUT -> analog input (SOIL_PIN)
-//   Use 3.3V to power the sensor when connecting to ESP32. Many breakout boards work with 3.3V.
-// - If your sensor breakout already has a pull-up or other circuitry, that's fine. Avoid powering the sensor
-//   from the ESP32 3.3V if the sensor will drive a heavy load; use a separate 3.3V/5V supply and common GND.
-// - LCD I2C 16x2: VCC -> 5V, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22
-//   Most I2C LCD modules work at 5V. ESP32 I2C pins are 3.3V but usually compatible.
-//   Default I2C address is 0x27 or 0x3F (check your module).
-// - RS485 NPK Sensor 7-in-1 (Soil N-P-K-pH-EC-Temp-Humidity):
-//   Left pins: VCC -> 5V, GND -> GND, A -> RS485 A, B -> RS485 B
-//   Right pins: DI -> TX2 (GPIO17), RO -> RX2 (GPIO16), DE+RE -> GPIO23
-#define DHT_PIN 4      // Temperature/humidity sensor pin (DHT11)
-#define DHT_TYPE DHT11 // DHT sensor type
-#define I2C_SDA 21     // I2C SDA pin for LCD (default ESP32)
-#define I2C_SCL 22     // I2C SCL pin for LCD (default ESP32)
+// Network
+#include "network/WiFiManager.h"
+#include "network/MQTTManager.h"
+#include "network/WebServer.h"
 
-// RS485 NPK Sensor 7-in-1 pins
-#define RS485_RX 16    // RO (Receiver Output) from sensor to ESP32 RX2
-#define RS485_TX 17    // DI (Driver Input) from ESP32 TX2 to sensor
-#define RS485_DE_RE 23 // DE (Driver Enable) and RE (Receiver Enable) tied together
-// Note: Connect both DE and RE pins of the sensor to GPIO 23
-// When HIGH: transmit mode (ESP32 sends data to sensor)
-// When LOW: receive mode (ESP32 receives data from sensor)
+// ========== GLOBAL OBJECTS ==========
+// Sensors
+DHTSensor dhtSensor(DHT_PIN, DHT_TYPE);
+HardwareSerial RS485Serial(2);
+NPKSensor npkSensor(&RS485Serial, RS485_DE_RE);
+MQ135Sensor mq135Sensor(MQ135_AO_PIN, MQ135_DO_PIN);
+TDSSensor tdsSensor(TDS_PIN);
 
-// Recommended analog pins for ESP32 (ADC1): 32, 33, 34, 35, 36, 39
-// Use an ADC1 pin to avoid conflicts with WiFi (ADC2 is shared with WiFi)
-// NOTE: Capacitive soil sensor REMOVED - using NPK sensor's built-in soil moisture instead
-// #define SOIL_PIN 34 // [REMOVED] Analog pin for capacitive soil moisture sensor
-// MQ-135 air quality sensor wiring: VCC -> 5V or 3.3V, GND -> GND, AO -> analog pin, DO -> digital pin (optional)
-// AO gives analog reading (0-4095 on ESP32), DO gives digital threshold output (HIGH/LOW based on onboard potentiometer)
-// Use ADC1 pins to avoid WiFi conflicts. For digital pin, use any available GPIO.
-#define MQ135_AO_PIN 35 // Analog pin for MQ-135 AO (air quality analog output)
-#define MQ135_DO_PIN 32 // Digital pin for MQ-135 DO (digital threshold output) - optional
-#define TDS_PIN 33      // Analog pin for TDS meter (A -> this pin). Use ADC1 pin (32-39) to avoid WiFi conflicts
-// Relay wiring: VCC, GND, IN. Relay module output pins: COM (common), NO (normally open), NC (normally closed).
-// For a pump, wire the pump's power supply through COM -> NO (pump powered when relay ON) for normally-open behavior.
-// Many 1-channel relay modules are active-low for the IN pin (drive LOW to activate). If unsure, test carefully.
-// If your relay module requires 5V VCC and a separate JD-VCC, follow the module documentation. Use an external power supply for the pump and common ground between ESP32 and relay module when needed.
-#define RELAY_PIN 27 // Relay pin for water pump (IN pin)
-// Set to true if your relay module is active-low (IN pulled LOW to activate relay). Most cheap modules are active-low.
-#define RELAY_ACTIVE_LOW true
-#define LED_STATUS_PIN 2 // Built-in ESP32 LED pin for status indicator
+// Controllers
+PumpController pumpController(RELAY_PIN, RELAY_ACTIVE_LOW);
 
-// ========== SENSOR & SYSTEM CONFIGURATION ==========
-// Note: Capacitive soil sensor removed - using NPK sensor's built-in soil moisture
-// const int SOIL_DRY_VALUE = 3000; // [REMOVED] ADC value when soil is dry (calibration)
-// const int SOIL_WET_VALUE = 1000; // [REMOVED] ADC value when soil is wet (calibration)
-const int MOISTURE_THRESHOLD = 30;  // Moisture threshold to start irrigation (%)
-const int MOISTURE_STOP = 70;       // Moisture threshold to stop irrigation (%)
-const int MAX_PUMP_TIME = 60;       // Maximum pump run time (seconds) for safety
-const int SENSOR_READ_INTERVAL = 2; // Sensor reading interval (seconds)
+// Display
+LCDDisplay lcdDisplay;
 
-// RS485 NPK Sensor Configuration
-const byte NPK_SENSOR_ADDRESS = 0x01;            // Default Modbus address (check sensor documentation)
-const long NPK_BAUD_RATE = 4800;                 // Baud rate 4800 (standard for this sensor)
-const byte MODBUS_READ_HOLDING_REGISTERS = 0x03; // Modbus function code
+// Network
+WiFiManager wifiManager;
+MQTTManager mqttManager;
+AgroWebServer webServer(80);
 
-// NPK Sensor Register Addresses (from sensor documentation)
-const uint16_t MOISTURE_REGISTER = 0x0000;     // Register 40001 - Moisture content (0.1% resolution)
-const uint16_t TEMPERATURE_REGISTER = 0x0001;  // Register 40002 - Temperature value (0.1°C resolution)
-const uint16_t CONDUCTIVITY_REGISTER = 0x0002; // Register 40003 - Electrical conductivity (uS/cm)
-const uint16_t PH_REGISTER = 0x0003;           // Register 40004 - PH value (0.1 resolution)
-const uint16_t NITROGEN_REGISTER = 0x0004;     // Register 40005 - Nitrogen content (mg/kg)
-const uint16_t PHOSPHORUS_REGISTER = 0x0005;   // Register 40006 - Phosphorus content (mg/kg)
-const uint16_t POTASSIUM_REGISTER = 0x0006;    // Register 40007 - Potassium content (mg/kg)
-
-// Safety: do not auto-start pump immediately after boot. Require a short delay
-// and require multiple consecutive "dry" readings to avoid false positives.
-const unsigned long BOOT_SAFE_DELAY = 15000; // ms to wait after boot before auto irrigation
-const int REQUIRED_CONSECUTIVE_DRY = 2;      // number of consecutive dry readings required before starting pump
-
-// ========== MQ-135 AIR QUALITY CONFIGURATION ==========
-const int MQ135_CLEAN_AIR_VALUE = 500;     // Typical ADC value in clean air (calibrate in fresh air)
-const int MQ135_POLLUTED_THRESHOLD = 1500; // ADC value indicating poor air quality (adjust based on environment)
-const float MQ135_VOLTAGE_REF = 3.3;       // Reference voltage for ADC (3.3V for ESP32)
-const float MQ135_ADC_MAX = 4095.0;        // 12-bit ADC max value
-// Basic conversion constants (approximate - for accurate ppm readings, use proper calibration curve)
-const float MQ135_RL_VALUE = 20.0;    // Load resistance on sensor board (kOhm) - check your module
-const float MQ135_RO_CLEAN_AIR = 3.6; // Sensor resistance in clean air (kOhm) - calibrate this
-
-// ========== GLOBAL VARIABLES ==========
-DHT dht(DHT_PIN, DHT_TYPE);
-WebServer server(80);
-WiFiClient espClient; // Use regular WiFiClient for non-TLS
-PubSubClient mqttClient(espClient);
-// LCD I2C - default address 0x27 (or 0x3F for some modules)
-// Format: LiquidCrystal_I2C(address, columns, rows)
-// Use pointer to allow dynamic instantiation after I2C address scan
-LiquidCrystal_I2C *lcd = nullptr;
-
-// RS485 Serial Port (use Serial2 on ESP32)
-HardwareSerial RS485Serial(2); // UART2 on ESP32
-
+// ========== TIMING VARIABLES ==========
 unsigned long lastSensorRead = 0;
-bool pumpActive = false;
-unsigned long pumpStartTime = 0;
+unsigned long lastNPKRead = 0;
+
+// ========== SENSOR DATA CACHE ==========
 int soilMoisture = 0;
 float temperature = 0;
 float humidity = 0;
-int airQuality = 0;         // MQ-135 air quality (0-100 scale, lower is better)
-int airQualityRaw = 0;      // Raw ADC reading from MQ-135
-bool airQualityGood = true; // Digital threshold status from DO pin
-
-// TDS sensor
-int tdsRaw = 0;   // raw ADC reading from TDS A pin
-int tdsValue = 0; // estimated TDS (ppm) - requires calibration
-
-// RS485 NPK Sensor 7-in-1 data
-float npk_nitrogen = 0.0;          // N content (mg/kg)
-float npk_phosphorus = 0.0;        // P content (mg/kg)
-float npk_potassium = 0.0;         // K content (mg/kg)
-float npk_ph = 0.0;                // pH value (0-14)
-float npk_ec = 0.0;                // EC value (mS/cm)
-float npk_temperature = 0.0;       // Soil temperature (°C)
-float npk_humidity = 0.0;          // Soil moisture/humidity (%)
-bool npk_sensor_available = false; // Sensor connection status
-
-// Statistik sistem
-unsigned long totalWateringTime = 0;
-int wateringCount = 0;
-int consecutiveDryCount = 0; // counter for consecutive dry readings
-
-// MQTT variables
-unsigned long lastMqttSensorPublish = 0;
-const unsigned long MQTT_SENSOR_INTERVAL = 2000; // Publish sensor data every 2 seconds
-unsigned long lastMqttReconnect = 0;
-const unsigned long MQTT_RECONNECT_INTERVAL = 5000; // Try reconnect every 5 seconds
-
-// WiFi Manager variables
-bool isAPMode = false;
-String scannedNetworks = "";
-
-// LCD display variables
-unsigned long lastLCDUpdate = 0;
-const unsigned long LCD_UPDATE_INTERVAL = 2000; // Update LCD every 2 seconds
-int lcdPage = 0;                                // 0=soil+temp, 1=humidity+air, 2=TDS+pump, 3=wifi+mqtt, 4=ssid+ip
-const int LCD_PAGES = 5;
-
-// NPK sensor reading variables
-unsigned long lastNPKRead = 0;
-const unsigned long NPK_READ_INTERVAL = 1000; // Read NPK sensor every 1 second
-
-// ========== WIFI MANAGER FUNCTIONS ==========
-void saveWiFiCredentials(String ssid, String password)
-{
-  preferences.begin("wifi", false);
-  preferences.putString("ssid", ssid);
-  preferences.putString("password", password);
-  preferences.end();
-  Serial.println("✅ WiFi credentials saved to flash");
-}
-
-void loadWiFiCredentials()
-{
-  preferences.begin("wifi", true);
-  savedSSID = preferences.getString("ssid", "");
-  savedPassword = preferences.getString("password", "");
-  preferences.end();
-
-  if (savedSSID.length() > 0)
-  {
-    Serial.println("📡 Loaded WiFi credentials from flash:");
-    Serial.println("   SSID: " + savedSSID);
-  }
-  else
-  {
-    Serial.println("⚠️  No saved WiFi credentials found");
-  }
-}
-
-void clearWiFiCredentials()
-{
-  preferences.begin("wifi", false);
-  preferences.clear();
-  preferences.end();
-  savedSSID = "";
-  savedPassword = "";
-  Serial.println("🗑️  WiFi credentials cleared");
-}
-
-String scanWiFiNetworks()
-{
-  Serial.println("🔍 Scanning WiFi networks...");
-  int n = WiFi.scanNetworks();
-  String networks = "";
-
-  if (n == 0)
-  {
-    networks = "No networks found";
-  }
-  else
-  {
-    Serial.printf("Found %d networks\n", n);
-    for (int i = 0; i < n; ++i)
-    {
-      networks += "<option value=\"" + WiFi.SSID(i) + "\">";
-      networks += WiFi.SSID(i);
-      networks += " (" + String(WiFi.RSSI(i)) + " dBm)";
-      networks += (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? " [Open]" : " [Secured]";
-      networks += "</option>";
-    }
-  }
-  return networks;
-}
-
-// ========== SENSOR FUNCTIONS ==========
-int readSoilMoisture()
-{
-  // Use NPK sensor's built-in soil moisture reading
-  // NPK humidity value is already in percentage (0-100%)
-  // Return npk_humidity as soil moisture, or 0 if sensor not available
-  if (npk_sensor_available && npk_humidity >= 0)
-  {
-    return (int)npk_humidity; // Convert float to int
-  }
-  else
-  {
-    // If NPK sensor not available, return 0 (dry)
-    return 0;
-  }
-}
-
-// ========== RS485 NPK SENSOR FUNCTIONS ==========
-// Calculate Modbus CRC16 (standard Modbus CRC)
-uint16_t calculateCRC16(uint8_t *data, uint8_t length)
-{
-  uint16_t crc = 0xFFFF;
-  for (uint8_t pos = 0; pos < length; pos++)
-  {
-    crc ^= (uint16_t)data[pos];
-    for (uint8_t i = 8; i != 0; i--)
-    {
-      if ((crc & 0x0001) != 0)
-      {
-        crc >>= 1;
-        crc ^= 0xA001;
-      }
-      else
-      {
-        crc >>= 1;
-      }
-    }
-  }
-  return crc;
-}
-
-// Create Modbus request frame
-void createNPKRequestFrame(uint8_t *frame, uint8_t deviceAddress, uint8_t functionCode,
-                           uint16_t registerAddress, uint16_t registerCount)
-{
-  frame[0] = deviceAddress;                 // Device address
-  frame[1] = functionCode;                  // Function code
-  frame[2] = (registerAddress >> 8) & 0xFF; // High byte of register address
-  frame[3] = registerAddress & 0xFF;        // Low byte of register address
-  frame[4] = (registerCount >> 8) & 0xFF;   // High byte of register count
-  frame[5] = registerCount & 0xFF;          // Low byte of register count
-
-  // Calculate CRC
-  uint16_t crc = calculateCRC16(frame, 6);
-  frame[6] = crc & 0xFF;        // Low byte of CRC (important: low byte first!)
-  frame[7] = (crc >> 8) & 0xFF; // High byte of CRC
-}
-
-// Read single register from NPK sensor (more reliable than batch read)
-uint16_t readNPKRegister(uint16_t registerAddress)
-{
-  uint8_t requestFrame[8];
-  uint8_t responseFrame[9];
-  uint16_t value = 0;
-
-  // Clear serial buffer
-  while (RS485Serial.available())
-  {
-    RS485Serial.read();
-  }
-
-  // Create the request frame (read 1 register)
-  createNPKRequestFrame(requestFrame, NPK_SENSOR_ADDRESS, MODBUS_READ_HOLDING_REGISTERS,
-                        registerAddress, 1);
-
-  // Set to transmit mode (DE/RE HIGH)
-  digitalWrite(RS485_DE_RE, HIGH);
-  delay(10);
-
-  // Send request
-  RS485Serial.write(requestFrame, sizeof(requestFrame));
-  RS485Serial.flush(); // Wait for transmission complete
-
-  // Set to receive mode (DE/RE LOW)
-  digitalWrite(RS485_DE_RE, LOW);
-  delay(10);
-
-  // Wait for and read response (timeout 1000ms)
-  unsigned long startTime = millis();
-  uint8_t index = 0;
-
-  while (millis() - startTime < 1000 && index < sizeof(responseFrame))
-  {
-    if (RS485Serial.available())
-    {
-      responseFrame[index++] = RS485Serial.read();
-    }
-  }
-
-  // Check if we received a complete response (minimum 7 bytes: addr + func + count + 2data + 2crc)
-  if (index >= 7)
-  {
-    // Verify CRC (CRC is at end: low byte then high byte)
-    uint16_t receivedCRC = (responseFrame[index - 1] << 8) | responseFrame[index - 2];
-    uint16_t calculatedCRC = calculateCRC16(responseFrame, index - 2);
-
-    if (receivedCRC == calculatedCRC && responseFrame[1] == MODBUS_READ_HOLDING_REGISTERS)
-    {
-      // Extract the value (big-endian format)
-      value = (responseFrame[3] << 8) | responseFrame[4];
-      return value;
-    }
-    else
-    {
-      Serial.printf("❌ NPK Reg 0x%04X: CRC error (recv:0x%04X calc:0x%04X)\n",
-                    registerAddress, receivedCRC, calculatedCRC);
-      return 0xFFFF; // Return error value
-    }
-  }
-  else
-  {
-    Serial.printf("❌ NPK Reg 0x%04X: Timeout (%d bytes)\n", registerAddress, index);
-    return 0xFFFF; // Return error value
-  }
-}
-
-// Read all NPK sensor data (reads each register individually for reliability)
-bool readNPKSensor()
-{
-  // Read all 7 registers one by one (more reliable than batch read)
-  uint16_t moisture_raw = readNPKRegister(MOISTURE_REGISTER);
-  delay(50); // Small delay between reads (reduced to 50ms for faster update)
-
-  uint16_t temperature_raw = readNPKRegister(TEMPERATURE_REGISTER);
-  delay(50);
-
-  uint16_t conductivity_raw = readNPKRegister(CONDUCTIVITY_REGISTER);
-  delay(50);
-
-  uint16_t ph_raw = readNPKRegister(PH_REGISTER);
-  delay(50);
-
-  uint16_t nitrogen_raw = readNPKRegister(NITROGEN_REGISTER);
-  delay(50);
-
-  uint16_t phosphorus_raw = readNPKRegister(PHOSPHORUS_REGISTER);
-  delay(50);
-
-  uint16_t potassium_raw = readNPKRegister(POTASSIUM_REGISTER);
-  delay(50);
-
-  // Check if at least some readings are valid (not all 0xFFFF)
-  int validReadings = 0;
-  if (moisture_raw != 0xFFFF)
-    validReadings++;
-  if (temperature_raw != 0xFFFF)
-    validReadings++;
-  if (conductivity_raw != 0xFFFF)
-    validReadings++;
-  if (ph_raw != 0xFFFF)
-    validReadings++;
-  if (nitrogen_raw != 0xFFFF)
-    validReadings++;
-  if (phosphorus_raw != 0xFFFF)
-    validReadings++;
-  if (potassium_raw != 0xFFFF)
-    validReadings++;
-
-  if (validReadings >= 4) // At least 4 out of 7 readings must be valid
-  {
-    // Convert raw values to actual measurements
-    npk_humidity = (moisture_raw != 0xFFFF) ? moisture_raw / 10.0 : -1.0;
-    npk_temperature = (temperature_raw != 0xFFFF) ? temperature_raw / 10.0 : -100.0;
-    npk_ec = (conductivity_raw != 0xFFFF) ? conductivity_raw / 1000.0 : -1.0; // Convert uS/cm to mS/cm
-    npk_ph = (ph_raw != 0xFFFF) ? ph_raw / 10.0 : -1.0;
-    npk_nitrogen = (nitrogen_raw != 0xFFFF) ? nitrogen_raw : 0;
-    npk_phosphorus = (phosphorus_raw != 0xFFFF) ? phosphorus_raw : 0;
-    npk_potassium = (potassium_raw != 0xFFFF) ? potassium_raw : 0;
-
-    npk_sensor_available = true;
-
-    Serial.println("=== 7-in-1 NPK Sensor Readings ===");
-    Serial.printf("Moisture: %.1f%%\n", npk_humidity);
-    Serial.printf("Temperature: %.1f°C\n", npk_temperature);
-    Serial.printf("Conductivity: %.0f uS/cm (%.3f mS/cm)\n", conductivity_raw * 1.0, npk_ec);
-    Serial.printf("pH: %.1f\n", npk_ph);
-    Serial.printf("Nitrogen (N): %.0f mg/kg\n", npk_nitrogen);
-    Serial.printf("Phosphorus (P): %.0f mg/kg\n", npk_phosphorus);
-    Serial.printf("Potassium (K): %.0f mg/kg\n", npk_potassium);
-    Serial.printf("Valid readings: %d/7\n", validReadings);
-    Serial.println("==================================");
-
-    return true;
-  }
-  else
-  {
-    npk_sensor_available = false;
-    Serial.printf("❌ NPK sensor failed (only %d/7 valid readings)\n", validReadings);
-    Serial.println("   Check: wiring, baud rate (4800), address (0x01)");
-    return false;
-  }
-}
-
-// ========== MQ-135 AIR QUALITY FUNCTIONS ==========
-int readAirQualityRaw()
-{
-  // Read multiple samples and average for stability
-  const int samples = 10;
-  long sum = 0;
-  for (int i = 0; i < samples; i++)
-  {
-    sum += analogRead(MQ135_AO_PIN);
-    delay(10);
-  }
-  return sum / samples;
-}
-
-int calculateAirQualityPercent(int rawValue)
-{
-  // Convert raw ADC to air quality percentage (0-100, lower is better)
-  // Higher ADC value = more pollution = worse air quality (higher percentage)
-  int qualityPercent = map(rawValue, MQ135_CLEAN_AIR_VALUE, MQ135_POLLUTED_THRESHOLD, 0, 100);
-  return constrain(qualityPercent, 0, 100);
-}
-
-float calculatePPM(int rawValue)
-{
-  // Basic PPM calculation (approximate - requires proper calibration for accuracy)
-  // This gives a rough estimate. For precise measurements, use datasheet calibration curves.
-  if (rawValue <= 0)
-    return 0;
-
-  float voltage = (rawValue / MQ135_ADC_MAX) * MQ135_VOLTAGE_REF;
-  float rs = ((MQ135_VOLTAGE_REF * MQ135_RL_VALUE) / voltage) - MQ135_RL_VALUE;
-  float ratio = rs / MQ135_RO_CLEAN_AIR;
-
-  // Simplified conversion to CO2 equivalent ppm (very approximate)
-  float ppm = 116.6020682 * pow(ratio, -2.769034857);
-  return constrain(ppm, 10, 2000); // Reasonable range for indoor air
-}
-
-void readAllSensors()
-{
-  soilMoisture = readSoilMoisture();
-  temperature = dht.readTemperature();
-  humidity = dht.readHumidity();
-
-  // NPK Sensor will be read separately in main loop (every 1 second)
-  // to avoid blocking other sensors
-
-  // Read TDS sensor
-  {
-    const int samples = 10;
-    long sum = 0;
-    for (int i = 0; i < samples; i++)
-    {
-      sum += analogRead(TDS_PIN);
-      delay(10);
-    }
-    tdsRaw = sum / samples;
-    // Convert raw ADC to voltage (12-bit ADC, reference 3.3V)
-    float voltage = (tdsRaw / 4095.0) * 3.3;
-    // Simple heuristic conversion to TDS (ppm) - module-specific and needs calibration
-    // Many TDS probes/modules output a voltage roughly proportional to conductivity.
-    // Use a calibration multiplier; default 500 is a rough starting point.
-    const float TDS_K = 500.0;
-    tdsValue = (int)(voltage * TDS_K);
-  }
-  // Print TDS to serial
-  Serial.printf("📡 TDS: %d ppm (raw: %d)\n", tdsValue, tdsRaw);
-
-  // Read MQ-135 air quality sensor
-  airQualityRaw = readAirQualityRaw();
-  airQuality = calculateAirQualityPercent(airQualityRaw);
-  airQualityGood = digitalRead(MQ135_DO_PIN) == LOW; // DO pin is typically LOW for good air quality
-
-  // Check if DHT readings were successful
-  if (isnan(temperature))
-    temperature = 0;
-  if (isnan(humidity))
-    humidity = 0;
-
-  // Update consecutive dry counter used by autoIrrigation safety
-  if (soilMoisture <= MOISTURE_THRESHOLD)
-  {
-    consecutiveDryCount++;
-  }
-  else
-  {
-    consecutiveDryCount = 0;
-  }
-}
-
-// ========== LCD DISPLAY FUNCTIONS ==========
-void updateLCD()
-{
-  if (!lcd)
-    return; // LCD not initialized
-
-  lcd->clear();
-
-  switch (lcdPage)
-  {
-  case 0: // Soil moisture & Temperature
-    lcd->setCursor(0, 0);
-    lcd->print("Soil:");
-    lcd->print(soilMoisture);
-    lcd->print("%");
-    if (soilMoisture <= MOISTURE_THRESHOLD)
-    {
-      lcd->print(" DRY");
-    }
-    else if (soilMoisture >= MOISTURE_STOP)
-    {
-      lcd->print(" WET");
-    }
-
-    lcd->setCursor(0, 1);
-    lcd->print("Temp:");
-    lcd->print(temperature, 1);
-    lcd->print((char)223); // degree symbol
-    lcd->print("C");
-    break;
-
-  case 1: // Humidity & Air Quality
-    lcd->setCursor(0, 0);
-    lcd->print("Humidity:");
-    lcd->print(humidity, 1);
-    lcd->print("%");
-
-    lcd->setCursor(0, 1);
-    lcd->print("Air:");
-    lcd->print(airQuality);
-    lcd->print("% ");
-    lcd->print(airQualityGood ? "OK" : "BAD");
-    break;
-
-  case 2: // TDS & Pump Status
-    lcd->setCursor(0, 0);
-    lcd->print("TDS:");
-    lcd->print(tdsValue);
-    lcd->print(" ppm");
-
-    lcd->setCursor(0, 1);
-    lcd->print("Pump:");
-    if (pumpActive)
-    {
-      lcd->print("ON ");
-      // Show pump runtime
-      unsigned long pumpTime = (millis() - pumpStartTime) / 1000;
-      lcd->print(pumpTime);
-      lcd->print("s");
-    }
-    else
-    {
-      lcd->print("OFF");
-    }
-    break;
-
-  case 3: // WiFi & MQTT Status
-    lcd->setCursor(0, 0);
-    if (isAPMode)
-    {
-      lcd->print("WiFi:AP Mode");
-    }
-    else if (WiFi.status() == WL_CONNECTED)
-    {
-      lcd->print("WiFi:OK ");
-      lcd->print(WiFi.RSSI());
-      lcd->print("dB");
-    }
-    else
-    {
-      lcd->print("WiFi:Disc");
-    }
-
-    lcd->setCursor(0, 1);
-    lcd->print("MQTT:");
-    lcd->print(mqttClient.connected() ? "ON" : "OFF");
-    lcd->print(" #");
-    lcd->print(wateringCount);
-    break;
-
-  case 4: // SSID & IP Address
-    lcd->setCursor(0, 0);
-    if (isAPMode)
-    {
-      lcd->print("AP:AgroHygra");
-    }
-    else if (WiFi.status() == WL_CONNECTED)
-    {
-      // Display SSID (truncate if too long)
-      String displaySSID = savedSSID;
-      if (displaySSID.length() > 16)
-      {
-        displaySSID = displaySSID.substring(0, 16);
-      }
-      lcd->print(displaySSID);
-    }
-    else
-    {
-      lcd->print("WiFi: No Conn");
-    }
-
-    lcd->setCursor(0, 1);
-    if (isAPMode)
-    {
-      lcd->print("192.168.4.1");
-    }
-    else if (WiFi.status() == WL_CONNECTED)
-    {
-      lcd->print(WiFi.localIP());
-    }
-    else
-    {
-      lcd->print("IP: ---");
-    }
-    break;
-  }
-
-  // Cycle through pages
-  lcdPage = (lcdPage + 1) % LCD_PAGES;
-}
-
-// ========== PUMP CONTROL FUNCTIONS ==========
-void startPump()
-{
-  if (!pumpActive)
-  {
-    // Activate relay according to module logic level
-    if (RELAY_ACTIVE_LOW)
-      digitalWrite(RELAY_PIN, LOW);
-    else
-      digitalWrite(RELAY_PIN, HIGH);
-    pumpActive = true;
-    pumpStartTime = millis();
-    wateringCount++;
-    Serial.println("🚰 PUMP ACTIVATED - Soil moisture low");
-
-    // Notify via MQTT
-    if (mqttClient.connected())
-    {
-      mqttClient.publish(TOPIC_PUMP_STATUS, "ON");
-      mqttClient.publish(TOPIC_LOGS, "Pump started automatically");
-    }
-  }
-}
-
-void stopPump()
-{
-  if (pumpActive)
-  {
-    // Deactivate relay according to module logic level
-    if (RELAY_ACTIVE_LOW)
-      digitalWrite(RELAY_PIN, HIGH);
-    else
-      digitalWrite(RELAY_PIN, LOW);
-    pumpActive = false;
-
-    // Record watering duration
-    unsigned long wateringDuration = (millis() - pumpStartTime) / 1000;
-    totalWateringTime += wateringDuration;
-
-    Serial.printf("🛑 PUMP DEACTIVATED - Duration: %lu seconds\n", wateringDuration);
-
-    // Notify via MQTT
-    if (mqttClient.connected())
-    {
-      mqttClient.publish(TOPIC_PUMP_STATUS, "OFF");
-      String logMsg = "Pump stopped - Duration: " + String(wateringDuration) + "s";
-      mqttClient.publish(TOPIC_LOGS, logMsg.c_str());
-    }
-  }
-}
-
-// ========== AUTO IRRIGATION LOGIC ==========
-void autoIrrigation()
-{
-  // Safety: do not auto-start immediately after boot
-  if (millis() < BOOT_SAFE_DELAY)
-  {
-    // optional: if pump is currently active we still enforce safety timeout elsewhere
-    Serial.println("⚠️  Delaying auto-irrigation (boot safe delay)");
-    return;
-  }
-
-  // Start watering if moisture is low
-  if (!pumpActive && soilMoisture <= MOISTURE_THRESHOLD)
-  {
-    // require multiple consecutive dry readings to avoid false triggers
-    if (consecutiveDryCount >= REQUIRED_CONSECUTIVE_DRY)
-    {
-      startPump();
-    }
-    else
-    {
-      Serial.printf("⚠️  Dry reading detected (%d%%) — but waiting for %d consecutive readings (have %d)\n", soilMoisture, REQUIRED_CONSECUTIVE_DRY, consecutiveDryCount);
-    }
-  }
-
-  // Stop watering if moisture is sufficient
-  if (pumpActive && soilMoisture >= MOISTURE_STOP)
-  {
-    stopPump();
-  }
-
-  // Safety: stop pump if it has been running too long
-  if (pumpActive && (millis() - pumpStartTime) >= (MAX_PUMP_TIME * 1000UL))
-  {
-    Serial.println("⚠️  SAFETY: Pump deactivated due to timeout!");
-    stopPump();
-  }
-}
-
-// ========== MQTT FUNCTIONS (PubSubClient) ==========
-void mqttCallback(char *topic, byte *payload, unsigned int length)
-{
-  // Convert payload to string
-  String message;
-  for (unsigned int i = 0; i < length; i++)
-  {
-    message += (char)payload[i];
-  }
-
-  Serial.printf("📨 MQTT message received on %s: %s\n", topic, message.c_str());
-
-  // Handle pump commands
-  if (strcmp(topic, TOPIC_PUMP_COMMAND) == 0)
-  {
-    if (message == "ON" || message == "on" || message == "1")
-    {
-      startPump();
-      mqttClient.publish(TOPIC_PUMP_STATUS, "ON");
-      mqttClient.publish(TOPIC_LOGS, "Pump started via MQTT command");
-    }
-    else if (message == "OFF" || message == "off" || message == "0")
-    {
-      stopPump();
-      mqttClient.publish(TOPIC_PUMP_STATUS, "OFF");
-      mqttClient.publish(TOPIC_LOGS, "Pump stopped via MQTT command");
-    }
-    else
-    {
-      // Try to parse JSON command
-      JsonDocument cmdDoc;
-      DeserializationError error = deserializeJson(cmdDoc, message);
-      if (!error && cmdDoc["pump"].is<bool>())
-      {
-        bool pumpCommand = cmdDoc["pump"];
-        if (pumpCommand)
-        {
-          startPump();
-          mqttClient.publish(TOPIC_PUMP_STATUS, "ON");
-        }
-        else
-        {
-          stopPump();
-          mqttClient.publish(TOPIC_PUMP_STATUS, "OFF");
-        }
-      }
-    }
-  }
-}
-
-void publishSensorData()
-{
-  if (!mqttClient.connected())
-  {
-    Serial.println("❌ Cannot publish sensor data - MQTT not connected");
-    return;
-  }
-
-  // Create smaller JSON to avoid buffer issues
-  JsonDocument sensorDoc;
-  sensorDoc["device"] = MQTT_CLIENT_ID;
-  sensorDoc["time"] = millis() / 1000; // shorter key
-  sensorDoc["soil"] = soilMoisture;    // shorter key
-  sensorDoc["temp"] = temperature;
-  sensorDoc["hum"] = humidity;
-  sensorDoc["air"] = airQuality;
-  sensorDoc["airRaw"] = airQualityRaw;
-  sensorDoc["airGood"] = airQualityGood;
-  sensorDoc["ppm"] = (int)calculatePPM(airQualityRaw);
-  sensorDoc["pump"] = pumpActive;
-  sensorDoc["count"] = wateringCount;
-  sensorDoc["wtime"] = totalWateringTime;
-  sensorDoc["uptime"] = millis() / 1000;
-  // TDS short fields
-  sensorDoc["tdsRaw"] = tdsRaw;
-  sensorDoc["tds"] = tdsValue; // ppm (approx)
-  // NPK Sensor data
-  if (npk_sensor_available)
-  {
-    sensorDoc["npk"]["n"] = npk_nitrogen;
-    sensorDoc["npk"]["p"] = npk_phosphorus;
-    sensorDoc["npk"]["k"] = npk_potassium;
-    sensorDoc["npk"]["ph"] = npk_ph;
-    sensorDoc["npk"]["ec"] = npk_ec;
-    sensorDoc["npk"]["soilTemp"] = npk_temperature;
-    sensorDoc["npk"]["soilMoist"] = npk_humidity;
-  }
-
-  String sensorPayload;
-  serializeJson(sensorDoc, sensorPayload);
-
-  Serial.printf("🔧 JSON payload size: %d bytes\n", sensorPayload.length());
-
-  // Try to publish to main topic
-  bool mainPublished = mqttClient.publish(TOPIC_SENSORS, sensorPayload.c_str());
-  Serial.printf("📤 Published sensor data to %s: %s (success: %s)\n",
-                TOPIC_SENSORS, sensorPayload.c_str(), mainPublished ? "YES" : "NO");
-
-  // If main publish fails, try simple test message
-  if (!mainPublished)
-  {
-    bool testPublished = mqttClient.publish("test/simple", "ESP32 test message");
-    Serial.printf("📤 Simple test publish: %s\n", testPublished ? "YES" : "NO");
-
-    // Try even simpler JSON
-    String simpleJson = "{\"device\":\"ESP32\",\"soil\":" + String(soilMoisture) + ",\"temp\":" + String(temperature) + "}";
-    bool simplePublished = mqttClient.publish("test/json", simpleJson.c_str());
-    Serial.printf("📤 Simple JSON publish (%d bytes): %s\n", simpleJson.length(), simplePublished ? "YES" : "NO");
-  }
-
-  // Check MQTT client state after publish
-  Serial.printf("🔧 MQTT State after publish: %d\n", mqttClient.state());
-}
-
-void connectToMqtt()
-{
-  if (WiFi.status() != WL_CONNECTED || mqttClient.connected())
-    return;
-
-  if (millis() - lastMqttReconnect < MQTT_RECONNECT_INTERVAL)
-    return;
-  lastMqttReconnect = millis();
-
-  Serial.println("🔗 Connecting to MQTT broker...");
-  Serial.printf("🔧 Broker: %s:%d\n", MQTT_HOST, MQTT_PORT);
-  Serial.printf("🔧 Client ID: %s\n", MQTT_CLIENT_ID);
-
-  if (mqttClient.connect(MQTT_CLIENT_ID))
-  {
-    Serial.println("✅ Connected to MQTT broker");
-    Serial.printf("🔧 MQTT State: %d (Connected)\n", mqttClient.state());
-
-    // Subscribe to pump command topic
-    if (mqttClient.subscribe(TOPIC_PUMP_COMMAND))
-    {
-      Serial.printf("📥 Subscribed to %s\n", TOPIC_PUMP_COMMAND);
-    }
-    else
-    {
-      Serial.printf("❌ Failed to subscribe to %s\n", TOPIC_PUMP_COMMAND);
-    }
-
-    // Publish system status
-    JsonDocument statusDoc;
-    statusDoc["device"] = MQTT_CLIENT_ID;
-    statusDoc["status"] = "online";
-    statusDoc["ip"] = WiFi.localIP().toString();
-    statusDoc["uptime"] = millis() / 1000;
-    statusDoc["firmware"] = "AgroHygra v1.0";
-
-    String statusPayload;
-    serializeJson(statusDoc, statusPayload);
-
-    bool statusPublished = mqttClient.publish(TOPIC_SYSTEM_STATUS, statusPayload.c_str(), true); // retained
-    Serial.printf("📤 System status published: %s (success: %s)\n",
-                  statusPayload.c_str(), statusPublished ? "YES" : "NO");
-
-    // Log connection
-    bool logPublished = mqttClient.publish(TOPIC_LOGS, "Device connected to MQTT broker");
-    Serial.printf("📤 Log published: %s\n", logPublished ? "YES" : "NO");
-
-    // Test publish a simple message
-    bool testPublished = mqttClient.publish("test/agrohygra", "ESP32 is online and publishing");
-    Serial.printf("📤 Test message published: %s\n", testPublished ? "YES" : "NO");
-  }
-  else
-  {
-    Serial.printf("❌ MQTT connection failed, rc=%d. Trying again in %d seconds\n",
-                  mqttClient.state(), MQTT_RECONNECT_INTERVAL / 1000);
-    Serial.println("❌ MQTT State meanings: -4=timeout, -3=connection lost, -2=connect failed, -1=disconnected, 0=connected");
-  }
-}
-
-void setupMqtt()
-{
-  // Set MQTT buffer size (default is only 256 bytes, too small for JSON)
-  mqttClient.setBufferSize(512);
-
-  // Set MQTT server and callback
-  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
-  mqttClient.setCallback(mqttCallback);
-
-  Serial.printf("🔧 MQTT configured for %s:%d (buffer size: 512)\n", MQTT_HOST, MQTT_PORT);
-}
-
-// ========== WEB SERVER - MAIN PAGE ==========
-void handleRoot()
-{
-  // Show main page even in AP mode. If AP mode is active, show a prominent banner
-  // with connection instructions and a link to the WiFi setup page instead of redirecting.
-  String apBanner = "";
-  if (isAPMode)
-  {
-    apBanner = R"rawliteral(
-        <div style="background:#fff3cd;padding:12px;border-radius:8px;border:1px solid #ffeeba;margin-bottom:12px;text-align:center;">
-          <strong>⚠️ AP Mode Active</strong><br>
-          Connect to <code>AgroHygra-Setup</code> (Open Network) or <a href="/wifi/setup">Open WiFi Setup</a>
-        </div>
-    )rawliteral";
-  }
-
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AgroHygra - Smart Irrigation</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; }
-        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        h1 { color: #2e7d32; text-align: center; margin-bottom: 30px; }
-        .wifi-btn { display: inline-block; background: linear-gradient(90deg,#2e7d32,#43a047); color: white; padding: 12px 22px; border-radius: 8px; font-size: 16px; text-decoration: none; box-shadow: 0 6px 14px rgba(67,160,71,0.24); margin-bottom: 18px; }
-        .wifi-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 20px rgba(67,160,71,0.28); }
-        .sensor-card { background: #e8f5e8; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #4caf50; transition: all 0.3s ease; }
-        .sensor-card.updating { background: #fff9c4; }
-        .sensor-value { font-size: 24px; font-weight: bold; color: #1b5e20; }
-        .sensor-label { font-size: 14px; color: #666; }
-        .status { padding: 10px; border-radius: 5px; text-align: center; margin: 15px 0; font-weight: bold; transition: all 0.3s ease; }
-        .status.on { background: #c8e6c9; color: #2e7d32; }
-        .status.off { background: #ffcdd2; color: #c62828; }
-        .controls { text-align: center; margin: 20px 0; }
-        .btn { padding: 12px 24px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; }
-        .btn-primary { background: #4caf50; color: white; }
-        .btn-secondary { background: #ff9800; color: white; }
-        .btn:hover { opacity: 0.8; }
-        .stats { background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 20px; }
-        .refresh { font-size: 12px; color: #666; text-align: center; margin-top: 15px; }
-        .live-indicator { display: inline-block; width: 10px; height: 10px; background: #4caf50; border-radius: 50%; margin-right: 5px; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-        .error-msg { background: #ffebee; color: #c62828; padding: 10px; border-radius: 5px; margin: 10px 0; display: none; }
-    </style>
-    <script>
-        let updateInterval;
-        
-        function updateData() {
-            fetch('/api/data')
-                .then(response => response.json())
-                .then(data => {
-                    // Update sensor values with smooth transition
-                    document.getElementById('soilMoisture').textContent = data.soilMoisture + '%';
-                    document.getElementById('temperature').textContent = data.temperature.toFixed(1) + '°C';
-                    document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
-                    document.getElementById('airQuality').textContent = data.airQuality + '% | ' + data.airQualityRaw + ' ADC';
-                    document.getElementById('airQualityStatus').textContent = 'Status: ' + (data.airQualityGood ? '🟢 Good' : '🔴 Poor') + ' | ~' + data.airQualityPPM + ' ppm';
-                    document.getElementById('tdsValue').textContent = data.tdsValuePPM + ' ppm | ' + data.tdsRaw + ' ADC';
-                    
-                    // Update NPK sensor data if available
-                    if (data.npkSensor && data.npkSensor.available) {
-                        document.getElementById('npkCard').style.display = 'block';
-                        document.getElementById('npkNitrogen').textContent = data.npkSensor.nitrogen.toFixed(0);
-                        document.getElementById('npkPhosphorus').textContent = data.npkSensor.phosphorus.toFixed(0);
-                        document.getElementById('npkPotassium').textContent = data.npkSensor.potassium.toFixed(0);
-                        document.getElementById('npkPh').textContent = data.npkSensor.ph.toFixed(1);
-                        document.getElementById('npkEc').textContent = data.npkSensor.ec.toFixed(3);
-                        document.getElementById('npkSoilTemp').textContent = data.npkSensor.soilTemperature.toFixed(1);
-                        document.getElementById('npkSoilMoist').textContent = data.npkSensor.soilMoisture.toFixed(1);
-                    } else {
-                        document.getElementById('npkCard').style.display = 'none';
-                    }
-                    
-                    // Update pump status
-                    const pumpStatus = document.getElementById('pumpStatus');
-                    const isPumpOn = data.pumpActive;
-                    pumpStatus.className = 'status ' + (isPumpOn ? 'on' : 'off');
-                    pumpStatus.textContent = 'Pump Status: ' + (isPumpOn ? '🟢 ACTIVE' : '🔴 OFF');
-                    
-                    // Update statistics
-                    document.getElementById('wateringCount').textContent = data.wateringCount;
-                    document.getElementById('totalWateringTime').textContent = data.totalWateringTime;
-                    document.getElementById('uptime').textContent = data.uptime;
-                    document.getElementById('mqttStatus').textContent = data.mqttConnected ? '🟢 Connected' : '🔴 Disconnected';
-                    
-                    // Update last update time
-                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
-                    
-                    // Hide error message if any
-                    document.getElementById('errorMsg').style.display = 'none';
-                })
-                .catch(error => {
-                    console.error('Error fetching data:', error);
-                    document.getElementById('errorMsg').style.display = 'block';
-                    document.getElementById('errorMsg').textContent = '⚠️ Error updating data: ' + error.message;
-                });
-        }
-        
-        // Start auto-update when page loads
-        window.onload = function() {  
-            // Update immediately
-            updateData();
-            // Then update every 2 seconds
-            updateInterval = setInterval(updateData, 2000);
-        };
-        
-        // Stop updates when page is hidden (battery saving)
-        document.addEventListener('visibilitychange', function() {
-            if (document.hidden) {
-                clearInterval(updateInterval);
-            } else {
-                updateData();
-                updateInterval = setInterval(updateData, 2000);
-            }
-        });
-    </script>
-</head>
-<body>
-  <div class="container">
-" )rawliteral" + apBanner +
-                R"rawliteral(
-        <h1>🌱 AgroHygra</h1>
-        <h2 style="text-align: center; color: #666;">
-            <span class="live-indicator"></span>Smart Irrigation System (Live)
-        </h2>
-        <div style="text-align:center;">
-            <a href="/wifi/setup" class="wifi-btn">⚙️ Change WiFi Settings</a>
-        </div>
-        
-        <div id="errorMsg" class="error-msg"></div>
-        
-        <div class="sensor-card">
-            <div class="sensor-label">Soil Moisture</div>
-            <div class="sensor-value" id="soilMoisture">--</div>
-        </div>
-        
-        <div class="sensor-card">
-            <div class="sensor-label">Air Temperature</div>
-            <div class="sensor-value" id="temperature">--</div>
-        </div>
-        
-        <div class="sensor-card">
-            <div class="sensor-label">Air Humidity</div>
-            <div class="sensor-value" id="humidity">--</div>
-        </div>
-        
-        <div class="sensor-card">
-            <div class="sensor-label">Air Quality (MQ-135)</div>
-            <div class="sensor-value" id="airQuality">--</div>
-            <div class="sensor-label" id="airQualityStatus">--</div>
-        </div>
-        
-        <div class="sensor-card">
-            <div class="sensor-label">TDS Meter</div>
-            <div class="sensor-value" id="tdsValue">--</div>
-            <div class="sensor-label">Note: approximate, calibrate for accurate readings</div>
-        </div>
-        
-        <div class="sensor-card" id="npkCard" style="display:none;">
-            <div class="sensor-label">🌾 NPK Sensor 7-in-1 (RS485)</div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
-                <div>
-                    <div class="sensor-label">Nitrogen (N)</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkNitrogen">--</span> mg/kg</div>
-                </div>
-                <div>
-                    <div class="sensor-label">Phosphorus (P)</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkPhosphorus">--</span> mg/kg</div>
-                </div>
-                <div>
-                    <div class="sensor-label">Potassium (K)</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkPotassium">--</span> mg/kg</div>
-                </div>
-                <div>
-                    <div class="sensor-label">pH Level</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkPh">--</span></div>
-                </div>
-                <div>
-                    <div class="sensor-label">EC (Conductivity)</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkEc">--</span> mS/cm</div>
-                </div>
-                <div>
-                    <div class="sensor-label">Soil Temp</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkSoilTemp">--</span>°C</div>
-                </div>
-                <div style="grid-column: 1 / -1;">
-                    <div class="sensor-label">Soil Moisture (NPK)</div>
-                    <div class="sensor-value" style="font-size: 18px;"><span id="npkSoilMoist">--</span>%</div>
-                </div>
-            </div>
-        </div>
-        
-        <div class="status off" id="pumpStatus">
-            Pump Status: 🔴 OFF
-        </div>
-        
-        <div class="controls">
-            <a href="/pump/on" class="btn btn-primary" onclick="setTimeout(updateData, 500)">&#x1F6B0; Turn On Pump</a>
-            <a href="/pump/off" class="btn btn-secondary" onclick="setTimeout(updateData, 500)">&#x1F6D1; Turn Off Pump</a>
-        </div>
-        
-        <div class="stats">
-            <h3>📊 System Statistics</h3>
-            <p><strong>Total Watering:</strong> <span id="wateringCount">0</span> times</p>
-            <p><strong>Total Pump Time:</strong> <span id="totalWateringTime">0</span> seconds</p>
-            <p><strong>Start Irrigation:</strong> &le;)rawliteral" +
-                String(MOISTURE_THRESHOLD) + R"rawliteral(%</p>
-            <p><strong>Stop Irrigation:</strong> &ge;)rawliteral" +
-                String(MOISTURE_STOP) + R"rawliteral(%</p>
-            <p><strong>Uptime:</strong> <span id="uptime">0</span> seconds</p>
-            <p><strong>WiFi Status:</strong> )rawliteral" +
-                String(WiFi.status() == WL_CONNECTED ? "Connected (" + WiFi.localIP().toString() + ")" : "AP Mode") + R"rawliteral(</p>
-            <p><strong>MQTT Status:</strong> <span id="mqttStatus">--</span></p>
-            <p><a href="/wifi/setup" style="color: #2196F3; text-decoration: none;">⚙️ Change WiFi Settings</a></p>
-        </div>
-        
-        <div class="stats">
-            <h3>🌐 Remote Access</h3>
-            <p><strong>MQTT Topics:</strong></p>
-            <p style="font-size: 12px; font-family: monospace;">
-            📤 Sensor: )rawliteral" +
-                String(TOPIC_SENSORS) + R"rawliteral(<br>
-            📥 Pump Control: )rawliteral" +
-                String(TOPIC_PUMP_COMMAND) + R"rawliteral(<br>
-            📊 System Status: )rawliteral" +
-                String(TOPIC_SYSTEM_STATUS) + R"rawliteral(<br>
-            📋 Logs: )rawliteral" +
-                String(TOPIC_LOGS) + R"rawliteral(
-            </p>
-            <p><strong>Pump Commands:</strong> Send "ON"/"OFF" or {"pump":true/false}</p>
-        </div>
-        
-        <div class="refresh">
-            🔄 Data updated in real-time every 2 seconds<br>
-            <span style="font-size: 11px;">Last update: <span id="lastUpdate">--</span></span><br>
-            <a href="/api/data" style="color: #4caf50;">📡 JSON Data</a>
-        </div>
-    </div>
-</body>
-</html>
-)rawliteral";
-
-  server.send(200, "text/html", html);
-}
-
-// ========== WEB SERVER - WIFI SETUP ==========
-void handleWiFiSetup()
-{
-  // Scan networks if not already scanned
-  if (scannedNetworks.length() == 0)
-  {
-    scannedNetworks = scanWiFiNetworks();
-  }
-
-  // Get current WiFi info
-  String currentInfo = "";
-  if (WiFi.status() == WL_CONNECTED && !isAPMode)
-  {
-    currentInfo = R"(
-        <div style="background: #c8e6c9; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-            <strong>✅ Currently Connected:</strong><br>
-            SSID: <strong>)" +
-                  WiFi.SSID() + R"(</strong><br>
-            IP: <strong>)" +
-                  WiFi.localIP().toString() + R"(</strong><br>
-            Signal: <strong>)" +
-                  String(WiFi.RSSI()) + R"( dBm</strong>
-        </div>
-    )";
-  }
-  else if (savedSSID.length() > 0)
-  {
-    currentInfo = R"(
-        <div style="background: #ffecb3; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-            <strong>⚠️ Last Saved WiFi:</strong><br>
-            SSID: <strong>)" +
-                  savedSSID + R"(</strong><br>
-            Status: Not Connected
-        </div>
-    )";
-  }
-
-  String html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AgroHygra - WiFi Setup</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; }
-        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        h1 { color: #2e7d32; text-align: center; margin-bottom: 10px; }
-        h2 { color: #666; text-align: center; font-size: 18px; margin-bottom: 30px; }
-        label { display: block; margin-top: 15px; color: #333; font-weight: bold; }
-        select, input { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; font-size: 16px; }
-        button { width: 100%; padding: 12px; margin-top: 20px; background: #4caf50; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; }
-        button:hover { background: #45a049; }
-        .info { background: #e3f2fd; padding: 15px; border-radius: 5px; margin-bottom: 20px; font-size: 14px; }
-        .btn-rescan { background: #ff9800; margin-top: 10px; }
-        .btn-rescan:hover { background: #f57c00; }
-        .btn-clear { background: #f44336; margin-top: 10px; }
-        .btn-clear:hover { background: #da190b; }
-        .btn-back { background: #2196F3; margin-top: 10px; }
-        .btn-back:hover { background: #0b7dda; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🌱 AgroHygra</h1>
-        <h2>WiFi Configuration</h2>
-        
-        )" + currentInfo +
-                R"(
-        
-        <div class="info">
-            📡 Connect AgroHygra to your WiFi network.<br>
-            Select a network and enter the password below.
-        </div>
-        
-        <form action="/wifi/save" method="POST">
-            <label for="ssid">Select WiFi Network:</label>
-            <select name="ssid" id="ssid" required>
-                <option value="">-- Select Network --</option>
-                )" +
-                scannedNetworks + R"(
-            </select>
-            
-            <label for="password">WiFi Password:</label>
-            <input type="password" name="password" id="password" placeholder="Enter WiFi password" required>
-            
-            <button type="submit">💾 Save and Connect</button>
-        </form>
-        
-        <form action="/wifi/scan" method="GET">
-            <button type="submit" class="btn-rescan">🔄 Rescan Networks</button>
-        </form>
-        
-        <form action="/wifi/clear" method="POST" onsubmit="return confirm('Clear saved WiFi credentials? Device will restart in AP mode.');">
-            <button type="submit" class="btn-clear">🗑️ Clear WiFi Credentials</button>
-        </form>
-        
-        <form action="/" method="GET">
-            <button type="submit" class="btn-back">🏠 Back to Home</button>
-        </form>
-    </div>
-</body>
-</html>
-)";
-
-  server.send(200, "text/html", html);
-}
-
-void handleWiFiScan()
-{
-  scannedNetworks = scanWiFiNetworks();
-  server.sendHeader("Location", "/wifi/setup");
-  server.send(302, "text/plain", "Redirecting");
-}
-
-void handleWiFiSave()
-{
-  if (server.hasArg("ssid") && server.hasArg("password"))
-  {
-    String newSSID = server.arg("ssid");
-    String newPassword = server.arg("password");
-
-    saveWiFiCredentials(newSSID, newPassword);
-
-    String html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WiFi Saved</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; text-align: center; padding-top: 50px; }
-        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        h1 { color: #4caf50; }
-        p { font-size: 16px; color: #666; margin: 20px 0; }
-        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #4caf50; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    </style>
-    <script>
-        setTimeout(function(){ 
-            window.location.href = "/"; 
-        }, 8000);
-    </script>
-</head>
-<body>
-    <div class="container">
-        <h1>✅ WiFi Credentials Saved!</h1>
-        <p>SSID: <strong>)" +
-                  newSSID + R"(</strong></p>
-        <p>ESP32 will restart and connect to the network...</p>
-        <div class="spinner"></div>
-        <p style="font-size: 14px; color: #999;">Redirecting in 8 seconds...</p>
-    </div>
-</body>
-</html>
-)";
-
-    server.send(200, "text/html", html);
-
-    delay(2000);
-    Serial.println("🔄 Restarting ESP32 to connect to new WiFi...");
-    delay(1000);
-    ESP.restart();
-  }
-  else
-  {
-    server.send(400, "text/plain", "Missing SSID or password");
-  }
-}
-
-void handleWiFiClear()
-{
-  clearWiFiCredentials();
-
-  String html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WiFi Cleared</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f8f0; text-align: center; padding-top: 50px; }
-        .container { max-width: 500px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-        h1 { color: #f44336; }
-        p { font-size: 16px; color: #666; margin: 20px 0; }
-        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #f44336; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🗑️ WiFi Credentials Cleared!</h1>
-        <p>ESP32 will restart in AP mode...</p>
-        <p>Connect to: <strong>AgroHygra-Setup</strong> (Open Network)</p>
-        <div class="spinner"></div>
-        <p style="font-size: 14px; color: #999;">Restarting...</p>
-    </div>
-</body>
-</html>
-)";
-
-  server.send(200, "text/html", html);
-
-  delay(2000);
-  Serial.println("🔄 Restarting ESP32 in AP mode...");
-  delay(1000);
-  ESP.restart();
-}
-
-// ========== WEB SERVER - PUMP CONTROL ==========
-void handlePumpOn()
-{
-  startPump();
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "Pump turned on");
-}
-
-void handlePumpOff()
-{
-  stopPump();
-  server.sendHeader("Location", "/");
-  server.send(302, "text/plain", "Pump turned off");
-}
-
-// ========== API JSON ==========
-void handleAPI()
-{
-  JsonDocument json;
-
-  json["soilMoisture"] = soilMoisture;
-  json["temperature"] = temperature;
-  json["humidity"] = humidity;
-  json["airQuality"] = airQuality;
-  json["airQualityRaw"] = airQualityRaw;
-  json["airQualityGood"] = airQualityGood;
-  json["airQualityPPM"] = (int)calculatePPM(airQualityRaw);
-  // verbose TDS info for API
-  json["tdsRaw"] = tdsRaw;
-  json["tdsValuePPM"] = tdsValue;
-  json["pumpActive"] = pumpActive;
-  json["wateringCount"] = wateringCount;
-  json["totalWateringTime"] = totalWateringTime;
-  json["moistureThreshold"] = MOISTURE_THRESHOLD;
-  json["moistureStop"] = MOISTURE_STOP;
-  json["uptime"] = millis() / 1000;
-  json["mqttConnected"] = mqttClient.connected();
-  json["wifiConnected"] = WiFi.status() == WL_CONNECTED;
-  json["ipAddress"] = WiFi.localIP().toString();
-  json["mqttTopics"]["sensors"] = TOPIC_SENSORS;
-  json["mqttTopics"]["pumpCommand"] = TOPIC_PUMP_COMMAND;
-  json["mqttTopics"]["pumpStatus"] = TOPIC_PUMP_STATUS;
-  json["mqttTopics"]["systemStatus"] = TOPIC_SYSTEM_STATUS;
-
-  // NPK Sensor data
-  if (npk_sensor_available)
-  {
-    json["npkSensor"]["available"] = true;
-    json["npkSensor"]["nitrogen"] = npk_nitrogen;
-    json["npkSensor"]["phosphorus"] = npk_phosphorus;
-    json["npkSensor"]["potassium"] = npk_potassium;
-    json["npkSensor"]["ph"] = npk_ph;
-    json["npkSensor"]["ec"] = npk_ec;
-    json["npkSensor"]["soilTemperature"] = npk_temperature;
-    json["npkSensor"]["soilMoisture"] = npk_humidity;
-  }
-  else
-  {
-    json["npkSensor"]["available"] = false;
-  }
-
-  String response;
-  serializeJson(json, response);
-
-  server.send(200, "application/json", response);
-}
-
-// ========== STATUS LED ==========
-void updateStatusLED()
-{
+int airQuality = 0;
+int airQualityRaw = 0;
+bool airQualityGood = true;
+int tdsValue = 0;
+int tdsRaw = 0;
+
+// ========== STATUS LED CONTROL ==========
+void updateStatusLED() {
   static unsigned long lastBlink = 0;
   static bool ledState = false;
-
-  if (pumpActive)
-  {
-    // Fast blink when pump is active
-    if (millis() - lastBlink >= 250)
-    {
+  
+  if (wifiManager.isConnected() && mqttManager.isConnected()) {
+    // Slow blink: all OK
+    if (millis() - lastBlink > 2000) {
       ledState = !ledState;
       digitalWrite(LED_STATUS_PIN, ledState);
       lastBlink = millis();
     }
-  }
-  else
-  {
-    // Always on during standby
+  } else if (wifiManager.isConnected()) {
+    // Fast blink: WiFi OK, MQTT disconnected
+    if (millis() - lastBlink > 500) {
+      ledState = !ledState;
+      digitalWrite(LED_STATUS_PIN, ledState);
+      lastBlink = millis();
+    }
+  } else {
+    // Solid on: WiFi disconnected
     digitalWrite(LED_STATUS_PIN, HIGH);
   }
 }
 
+// ========== READ ALL SENSORS ==========
+void readAllSensors() {
+  // Read DHT sensor
+  dhtSensor.read();
+  temperature = dhtSensor.getTemperature();
+  humidity = dhtSensor.getHumidity();
+  
+  // Read MQ135 air quality sensor
+  mq135Sensor.read();
+  airQuality = mq135Sensor.getQualityPercent();
+  airQualityRaw = mq135Sensor.getRawValue();
+  airQualityGood = mq135Sensor.isGoodQuality();
+  
+  // Read TDS sensor
+  tdsSensor.read();
+  tdsValue = tdsSensor.getTDS();
+  tdsRaw = tdsSensor.getRawValue();
+  
+  // Get soil moisture from NPK sensor
+  if (npkSensor.isAvailable() && npkSensor.getHumidity() >= 0) {
+    soilMoisture = (int)npkSensor.getHumidity();
+  } else {
+    soilMoisture = 0;
+  }
+  
+  // Update consecutive dry counter for pump controller
+  if (soilMoisture <= MOISTURE_THRESHOLD) {
+    int count = pumpController.getConsecutiveDryCount() + 1;
+    pumpController.setConsecutiveDryCount(count);
+  } else {
+    pumpController.setConsecutiveDryCount(0);
+  }
+  
+  Serial.printf("📊 Sensors: Soil=%d%% Temp=%.1f°C Hum=%.1f%% Air=%d%% TDS=%dppm\n",
+                soilMoisture, temperature, humidity, airQuality, tdsValue);
+}
+
+// ========== PUBLISH MQTT DATA ==========
+void publishSensorData() {
+  if (!mqttManager.isConnected()) return;
+  
+  JsonDocument doc;
+  doc["device"] = MQTT_CLIENT_ID;
+  doc["time"] = millis() / 1000;
+  doc["soil"] = soilMoisture;
+  doc["temp"] = temperature;
+  doc["hum"] = humidity;
+  doc["air"] = airQuality;
+  doc["airRaw"] = airQualityRaw;
+  doc["airGood"] = airQualityGood;
+  doc["ppm"] = (int)mq135Sensor.getPPM();
+  doc["pump"] = pumpController.isPumpActive();
+  doc["count"] = pumpController.getWateringCount();
+  doc["wtime"] = pumpController.getTotalWateringTime();
+  doc["uptime"] = millis() / 1000;
+  doc["tdsRaw"] = tdsRaw;
+  doc["tds"] = tdsValue;
+  
+  // NPK Sensor data
+  if (npkSensor.isAvailable()) {
+    doc["npk"]["n"] = npkSensor.getNitrogen();
+    doc["npk"]["p"] = npkSensor.getPhosphorus();
+    doc["npk"]["k"] = npkSensor.getPotassium();
+    doc["npk"]["ph"] = npkSensor.getPH();
+    doc["npk"]["ec"] = npkSensor.getEC();
+    doc["npk"]["soilTemp"] = npkSensor.getTemperature();
+  }
+  
+  mqttManager.publishSensorData(doc);
+}
+
 // ========== SETUP ==========
-void setup()
-{
+void setup() {
+  // Initialize Serial
   Serial.begin(115200);
-  Serial.println("\n🌱 AgroHygra - Smart Irrigation System");
-  Serial.println("=====================================");
-
-  // Setup pin
-  pinMode(RELAY_PIN, OUTPUT);
+  delay(1000);
+  Serial.println("\n\n");
+  Serial.println("================================");
+  Serial.println("   🌱 AgroHygra System v2.0    ");
+  Serial.println("   Modular Architecture        ");
+  Serial.println("================================");
+  
+  // Initialize status LED
   pinMode(LED_STATUS_PIN, OUTPUT);
-  pinMode(MQ135_DO_PIN, INPUT);   // MQ-135 digital output pin
-  pinMode(RS485_DE_RE, OUTPUT);   // RS485 DE/RE control pin
-  digitalWrite(RS485_DE_RE, LOW); // Set to receive mode initially
-
-  // Make sure pump is off at startup (respect relay active-low option)
-  if (RELAY_ACTIVE_LOW)
-    digitalWrite(RELAY_PIN, HIGH);
-  else
-    digitalWrite(RELAY_PIN, LOW);
-  // LED off initially
-  digitalWrite(LED_STATUS_PIN, LOW);
-
-  // Initialize RS485 Serial for NPK Sensor
-  RS485Serial.begin(NPK_BAUD_RATE, SERIAL_8N1, RS485_RX, RS485_TX);
-  Serial.println("🔧 RS485 Serial initialized for NPK Sensor");
-  Serial.printf("   RX: GPIO%d, TX: GPIO%d, DE/RE: GPIO%d\n", RS485_RX, RS485_TX, RS485_DE_RE);
-  Serial.printf("   Baud Rate: %ld, Address: 0x%02X\n", NPK_BAUD_RATE, NPK_SENSOR_ADDRESS);
-
-  // Initialize I2C for LCD
-  Wire.begin(I2C_SDA, I2C_SCL);
-  delay(100); // Give I2C bus time to stabilize
-
-  // Try to detect common I2C LCD addresses and instantiate LCD dynamically
-  const uint8_t candidates[] = {0x27, 0x3F};
-  uint8_t foundAddr = 0;
-
-  Serial.println("🔍 Scanning for I2C LCD...");
-  for (uint8_t i = 0; i < sizeof(candidates); i++)
-  {
-    Wire.beginTransmission(candidates[i]);
-    if (Wire.endTransmission() == 0)
-    {
-      foundAddr = candidates[i];
-      Serial.printf("   Found I2C device at 0x%02X\n", foundAddr);
-      break;
+  digitalWrite(LED_STATUS_PIN, HIGH);
+  
+  // Initialize sensors
+  Serial.println("\n📡 Initializing sensors...");
+  dhtSensor.begin();
+  npkSensor.begin();
+  mq135Sensor.begin();
+  tdsSensor.begin();
+  
+  // Initialize pump controller
+  Serial.println("\n💧 Initializing pump controller...");
+  pumpController.begin();
+  
+  // Initialize LCD
+  Serial.println("\n📺 Initializing LCD display...");
+  if (lcdDisplay.begin(0x27)) {
+    lcdDisplay.showMessage("AgroHygra v2.0", "Starting...");
+  } else {
+    Serial.println("⚠️  LCD initialization failed, trying 0x3F...");
+    if (lcdDisplay.begin(0x3F)) {
+      lcdDisplay.showMessage("AgroHygra v2.0", "Starting...");
+    } else {
+      Serial.println("❌ LCD not found!");
     }
   }
-
-  if (foundAddr != 0)
-  {
-    Serial.printf("✅ LCD I2C detected at 0x%02X\n", foundAddr);
-
-    // enjoyneering/LiquidCrystal_I2C v1.4.0 constructor
-    // Standard PCF8574 LCD backpack mapping: P0-P7 map to LCD pins 4,5,6,16,11,12,13,14
-    // LiquidCrystal_I2C(address, P0, P1, P2, P3, P4, P5, P6, P7, polarity)
-    lcd = new LiquidCrystal_I2C((pcf8574Address)foundAddr, 4, 5, 6, 16, 11, 12, 13, 14, POSITIVE);
-
-    if (lcd)
-    {
-      // Initialize LCD with columns and rows
-      if (lcd->begin(16, 2) == true)
-      {
-        Serial.println("✅ LCD initialized successfully");
-        // lcd->backlight();
-        lcd->clear();
-        lcd->setCursor(0, 0);
-        lcd->print("  AgroHygra  ");
-        lcd->setCursor(0, 1);
-        lcd->print("  Booting...  ");
-        delay(1500);
-      }
-      else
-      {
-        Serial.println("❌ LCD begin() failed");
-        delete lcd;
-        lcd = nullptr;
-      }
-    }
+  
+  // Initialize WiFi
+  Serial.println("\n📡 Initializing WiFi...");
+  wifiManager.begin();
+  wifiManager.loadCredentials();
+  
+  if (!wifiManager.connect()) {
+    Serial.println("⚠️  WiFi connection failed, starting AP mode...");
+    wifiManager.startAPMode();
+    lcdDisplay.showMessage("AP Mode", "192.168.4.1");
+  } else {
+    lcdDisplay.showMessage("WiFi Connected", WiFi.localIP().toString());
   }
-  else
-  {
-    Serial.println("❌ I2C LCD not found at 0x27/0x3F. LCD disabled.");
-    Serial.println("   Tip: Check wiring (SDA=21, SCL=22, VCC=5V, GND=GND)");
-  }
-
-  // Initialize DHT sensor
-  dht.begin();
-
-  // Load WiFi credentials from flash
-  loadWiFiCredentials();
-
-  // Connect to WiFi
-  if (savedSSID.length() > 0)
-  {
-    Serial.print("🔗 Connecting to WiFi: ");
-    Serial.println(savedSSID);
-
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
-
-    int wifiTimeout = 0;
-    while (WiFi.status() != WL_CONNECTED && wifiTimeout < 30)
-    {
-      delay(1000);
-      Serial.print(".");
-      wifiTimeout++;
-    }
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      isAPMode = false;
-      Serial.println("\n✅ WiFi connected!");
-      Serial.print("📡 IP Address: ");
-      Serial.println(WiFi.localIP());
-      Serial.println("🌐 Access web interface at: http://" + WiFi.localIP().toString());
-
-      // Display WiFi connected on LCD
-      if (lcd)
-      {
-        lcd->clear();
-        lcd->setCursor(0, 0);
-        lcd->print("WiFi:");
-        // Truncate SSID if too long (max 11 chars after "WiFi:")
-        String shortSSID = savedSSID;
-        if (shortSSID.length() > 11)
-        {
-          shortSSID = shortSSID.substring(0, 11);
-        }
-        lcd->print(shortSSID);
-
-        lcd->setCursor(0, 1);
-        lcd->print("IP:");
-        lcd->print(WiFi.localIP());
-        delay(4000);
-      }
-      else
-      {
-        Serial.println("(lcd) Skipped LCD display: not initialized");
-      }
-
-      // Setup mDNS (can access via http://agrohygra.local)
-      if (MDNS.begin("agrohygra"))
-      {
-        Serial.println("🌐 mDNS started: http://agrohygra.local");
-      }
-    }
-    else
-    {
-      Serial.println("\n❌ WiFi connection failed! Starting Access Point mode...");
-      isAPMode = true;
-    }
-  }
-  else
-  {
-    Serial.println("⚠️  No WiFi credentials saved. Starting AP mode...");
-    isAPMode = true;
-  }
-
-  // Setup as Access Point if not connected or no credentials
-  if (isAPMode)
-  {
-    WiFi.mode(WIFI_AP);
-    const char *ap_ssid = "AgroHygra-Setup";
-
-    // Open network (no password) for easy setup access
-    bool apStarted = WiFi.softAP(ap_ssid);
-    if (apStarted)
-    {
-      IPAddress apIP = WiFi.softAPIP();
-      Serial.println("✅ Access Point started for WiFi configuration!");
-      Serial.println("📡 SSID: " + String(ap_ssid));
-      // Serial.println("🔐 Password: " + String(ap_password));
-      Serial.println("🌐 IP Address: " + apIP.toString());
-      Serial.println("🌐 Access WiFi setup at: http://" + apIP.toString());
-      Serial.println("   or http://192.168.4.1");
-
-      // Display AP mode on LCD
-      if (lcd)
-      {
-        lcd->clear();
-        lcd->setCursor(0, 0);
-        lcd->print("AP Mode Active");
-        lcd->setCursor(0, 1);
-        lcd->print(apIP);
-        delay(3000);
-      }
-      else
-      {
-        Serial.println("(lcd) Skipped AP LCD display: not initialized");
-      }
-
-      // Scan networks on startup for AP mode
-      scannedNetworks = scanWiFiNetworks();
-    }
-    else
-    {
-      Serial.println("❌ Failed to start Access Point!");
-    }
-  }
-
-  // Setup web server routes
-  server.on("/", handleRoot);
-  server.on("/wifi/setup", handleWiFiSetup);
-  server.on("/wifi/scan", handleWiFiScan);
-  server.on("/wifi/save", HTTP_POST, handleWiFiSave);
-  server.on("/wifi/clear", HTTP_POST, handleWiFiClear);
-  server.on("/pump/on", handlePumpOn);
-  server.on("/pump/off", handlePumpOff);
-  server.on("/api/data", handleAPI);
-
-  // Start web server
-  server.begin();
-  Serial.println("🌐 Web server started on port 80");
-
-  // Setup MQTT (only if WiFi connected)
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    setupMqtt();
-    connectToMqtt();
-  }
-
-  // Print final access instructions
-  Serial.println("=====================================");
-  Serial.println("✅ SYSTEM READY!");
-  if (isAPMode)
-  {
-    Serial.println("🔧 MODE: WiFi Setup (Access Point)");
-    Serial.println("📱 Connect to 'AgroHygra-Setup' WiFi (Open Network)");
-    Serial.println("📱 Then open browser to: http://192.168.4.1");
-    Serial.println("   for WiFi configuration");
-  }
-  else if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("📱 Open browser and visit:");
-    Serial.println("   http://" + WiFi.localIP().toString());
-    Serial.println("   or http://agrohygra.local");
-  }
-  else
-  {
-    Serial.println("📱 Connect to 'AgroHygra-Setup' WiFi (Open Network)");
-    Serial.println("📱 Then open browser to: http://192.168.4.1");
-  }
-  Serial.println("=====================================");
-
-  // Read sensors first time
-  if (!isAPMode)
-  {
-    readAllSensors();
-
-    Serial.println("✅ System ready!");
-    Serial.printf("🌾 Soil moisture (from NPK sensor): %d%%\n", soilMoisture);
-    Serial.printf("🌡️  Air Temperature: %.1f°C, Air humidity: %.1f%%\n", temperature, humidity);
-    Serial.printf("🌬️  Air quality: %d%% (ADC: %d, Status: %s, ~%d ppm)\n",
-                  airQuality, airQualityRaw, airQualityGood ? "Good" : "Poor", (int)calculatePPM(airQualityRaw));
-
-    // Test NPK sensor connection
-    Serial.println("🔍 Testing NPK Sensor connection...");
-    if (readNPKSensor())
-    {
-      Serial.println("✅ NPK Sensor connected and working!");
-      Serial.println("   Note: Soil moisture data from NPK sensor is now used for irrigation");
-    }
-    else
-    {
-      Serial.println("⚠️  NPK Sensor not detected - check wiring and address");
-      Serial.println("   Expected: RX=GPIO16, TX=GPIO17, DE/RE=GPIO23");
-      Serial.println("   Power: VCC=5V, GND=GND, A/B=RS485 line");
-      Serial.println("   WARNING: Soil moisture will be 0% until NPK sensor connects!");
-    }
-
-    // Display initial sensor readings on LCD
-    if (lcd)
-    {
-      lcd->clear();
-      lcd->setCursor(0, 0);
-      lcd->print("System Ready!");
-      lcd->setCursor(0, 1);
-      lcd->print("Soil:");
-      lcd->print(soilMoisture);
-      lcd->print("% ");
-      lcd->print(temperature, 1);
-      lcd->print((char)223);
-      lcd->print("C");
-      delay(2000);
-    }
-    else
-    {
-      Serial.println("(lcd) Skipped initial sensor LCD display: not initialized");
-    }
-  }
-  else
-  {
-    Serial.println("✅ System in WiFi setup mode");
-  }
-  Serial.println("=====================================");
-
-  // Configure ADC for MQ-135 and TDS (ESP32)
-  // ADC1 channel pins (32-39) for analog sensors
-  analogReadResolution(12); // 12-bit resolution (0-4095)
-  // Set attenuation to allow reading full range with sensor values (0-3.3V)
-  // Note: Capacitive soil sensor removed - using NPK sensor's soil moisture
-  analogSetPinAttenuation(MQ135_AO_PIN, ADC_11db);
-  // Configure TDS pin attenuation (use ADC1 pin to avoid WiFi conflicts)
-  analogSetPinAttenuation(TDS_PIN, ADC_11db);
-
-  // NOTE: If your TDS module is powered at 5V and A output ranges up to 5V, DO NOT
-  // connect directly to the ESP32 ADC. Use a voltage divider to bring 0-5V down to 0-3.3V.
+  
+  delay(2000);
+  
+  // Initialize MQTT
+  Serial.println("\n📨 Initializing MQTT...");
+  mqttManager.begin();
+  mqttManager.setPumpController(&pumpController);
+  
+  // Initialize Web Server
+  Serial.println("\n🌐 Initializing web server...");
+  webServer.begin();
+  webServer.setWiFiManager(&wifiManager);
+  webServer.setPumpController(&pumpController);
+  webServer.setSensors(&npkSensor, &mq135Sensor, &tdsSensor, &dhtSensor);
+  
+  Serial.println("\n================================");
+  Serial.println("✅ System initialized!");
+  Serial.println("================================");
+  Serial.printf("Web Interface: http://%s\n", 
+                wifiManager.isAPMode() ? "192.168.4.1" : WiFi.localIP().toString().c_str());
+  Serial.println("================================\n");
 }
 
 // ========== MAIN LOOP ==========
-void loop()
-{
-  // Handle web server
-  server.handleClient();
-
-  // Skip sensor and MQTT operations if in AP setup mode
-  if (isAPMode)
-  {
-    delay(100);
-    return;
-  }
-
-  // Monitor WiFi connection (ESP32 specific)
-  static unsigned long lastWiFiCheck = 0;
-  if (millis() - lastWiFiCheck >= 30000)
-  { // Check every 30 seconds
-    lastWiFiCheck = millis();
-    if (WiFi.getMode() == WIFI_STA && WiFi.status() != WL_CONNECTED)
-    {
-      Serial.println("⚠️  WiFi disconnected, attempting reconnect...");
-      WiFi.reconnect();
-    }
-  }
-
-  // Read NPK sensor every 1 second (separate from other sensors)
-  if (millis() - lastNPKRead >= NPK_READ_INTERVAL)
-  {
+void loop() {
+  // Read NPK sensor every second
+  if (millis() - lastNPKRead >= NPK_READ_INTERVAL) {
     lastNPKRead = millis();
-    readNPKSensor();
+    npkSensor.readSensor();
   }
-
-  // Read sensors periodically
-  if (millis() - lastSensorRead >= (SENSOR_READ_INTERVAL * 1000UL))
-  {
+  
+  // Read all other sensors every 2 seconds
+  if (millis() - lastSensorRead >= (SENSOR_READ_INTERVAL * 1000UL)) {
     lastSensorRead = millis();
-
     readAllSensors();
-
-    // Display data to Serial Monitor
-    Serial.printf("📊 Soil: %d%% | Temp: %.1f°C | RH: %.1f%% | Air: %d%% | Pump: %s\n",
-                  soilMoisture, temperature, humidity, airQuality,
-                  pumpActive ? "ON" : "OFF");
-
-    // Run auto irrigation logic
-    autoIrrigation();
+    
+    // Publish sensor data via MQTT
+    publishSensorData();
+    
+    // Update web server with latest data
+    webServer.updateSensorData(soilMoisture, temperature, humidity, 
+                              airQuality, airQualityRaw, airQualityGood,
+                              tdsValue, tdsRaw);
+    
+    // Update LCD display
+    lcdDisplay.setData(soilMoisture, temperature, humidity, 
+                      airQuality, airQualityGood, tdsValue,
+                      pumpController.isPumpActive(), 
+                      pumpController.getPumpRunTime() / 1000,
+                      pumpController.getWateringCount(),
+                      mqttManager.isConnected(),
+                      wifiManager.isAPMode(),
+                      wifiManager.getSSID(),
+                      wifiManager.isAPMode() ? "192.168.4.1" : WiFi.localIP().toString());
   }
-
-  // Handle MQTT connection and publishing
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    // Try to connect to MQTT if not connected
-    connectToMqtt();
-
-    // Keep MQTT connection alive
-    mqttClient.loop();
-
-    // Publish sensor data periodically
-    if (mqttClient.connected() && millis() - lastMqttSensorPublish >= MQTT_SENSOR_INTERVAL)
-    {
-      lastMqttSensorPublish = millis();
-      publishSensorData();
-    }
-
-    // Debug MQTT connection status every 10 seconds
-    static unsigned long lastMqttDebug = 0;
-    if (millis() - lastMqttDebug >= 10000)
-    {
-      lastMqttDebug = millis();
-      Serial.printf("🔧 MQTT Status: Connected=%s, State=%d\n",
-                    mqttClient.connected() ? "YES" : "NO", mqttClient.state());
-    }
-  }
-  else
-  {
-    Serial.println("⚠️  WiFi not connected - skipping MQTT");
-  }
-
+  
+  // Update LCD (handles its own timing)
+  lcdDisplay.update();
+  
+  // Auto irrigation logic
+  pumpController.autoIrrigate(soilMoisture);
+  
+  // Handle network tasks
+  mqttManager.loop();
+  webServer.loop();
+  
   // Update status LED
   updateStatusLED();
-
-  // Update LCD display periodically
-  if (millis() - lastLCDUpdate >= LCD_UPDATE_INTERVAL)
-  {
-    lastLCDUpdate = millis();
-    updateLCD();
-  }
-
-  // Small delay for stability
-  delay(100);
+  
+  // Small delay to prevent watchdog timeout
+  delay(10);
 }
