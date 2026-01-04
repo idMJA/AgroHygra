@@ -6,52 +6,67 @@
 #include "sensors/TDSSensor.h"
 #include "sensors/DHTSensor.h"
 
-AgroWebServer::AgroWebServer(int port) 
-  : server(port), wifiManager(nullptr), pumpController(nullptr),
-    npkSensor(nullptr), mq135Sensor(nullptr), tdsSensor(nullptr), dhtSensor(nullptr),
-    soilMoisture(0), temperature(0), humidity(0), airQuality(0), 
-    airQualityRaw(0), airQualityGood(true), tdsValue(0), tdsRaw(0) {
+AgroWebServer::AgroWebServer(int port)
+    : server(port), wifiManager(nullptr), pumpController(nullptr),
+      npkSensor(nullptr), mq135Sensor(nullptr), tdsSensor(nullptr), dhtSensor(nullptr),
+      soilMoisture(0), temperature(0), humidity(0), airQuality(0),
+      airQualityRaw(0), airQualityGood(true), tdsValue(0), tdsRaw(0)
+{
 }
 
-void AgroWebServer::begin() {
+void AgroWebServer::begin()
+{
   // Setup routes
-  server.on("/", [this]() { this->handleRoot(); });
-  server.on("/wifi", [this]() { this->handleWiFiSetup(); });
-  server.on("/wifi/scan", [this]() { this->handleWiFiScan(); });
-  server.on("/wifi/save", HTTP_POST, [this]() { this->handleWiFiSave(); });
-  server.on("/wifi/clear", HTTP_POST, [this]() { this->handleWiFiClear(); });
-  server.on("/pump/on", [this]() { this->handlePumpOn(); });
-  server.on("/pump/off", [this]() { this->handlePumpOff(); });
-  server.on("/api", [this]() { this->handleAPI(); });
-  
+  server.on("/", [this]()
+            { this->handleRoot(); });
+  server.on("/wifi", [this]()
+            { this->handleWiFiSetup(); });
+  server.on("/wifi/scan", [this]()
+            { this->handleWiFiScan(); });
+  server.on("/wifi/save", HTTP_POST, [this]()
+            { this->handleWiFiSave(); });
+  server.on("/wifi/clear", HTTP_POST, [this]()
+            { this->handleWiFiClear(); });
+  server.on("/pump/on", [this]()
+            { this->handlePumpOn(); });
+  server.on("/pump/off", [this]()
+            { this->handlePumpOff(); });
+  server.on("/api", [this]()
+            { this->handleAPI(); });
+
   server.begin();
-  
+
   // Start mDNS
-  if (MDNS.begin("agrohygra")) {
+  if (MDNS.begin("agrohygra"))
+  {
     Serial.println("✅ mDNS responder started: http://agrohygra.local");
     MDNS.addService("http", "tcp", 80);
   }
-  
+
   Serial.println("✅ Web server started");
 }
 
-void AgroWebServer::setWiFiManager(WiFiManager *manager) {
+void AgroWebServer::setWiFiManager(WiFiManager *manager)
+{
   wifiManager = manager;
 }
 
-void AgroWebServer::setPumpController(PumpController *controller) {
+void AgroWebServer::setPumpController(PumpController *controller)
+{
   pumpController = controller;
 }
 
-void AgroWebServer::setSensors(NPKSensor *npk, MQ135Sensor *mq135, TDSSensor *tds, DHTSensor *dht) {
+void AgroWebServer::setSensors(NPKSensor *npk, MQ135Sensor *mq135, TDSSensor *tds, DHTSensor *dht)
+{
   npkSensor = npk;
   mq135Sensor = mq135;
   tdsSensor = tds;
   dhtSensor = dht;
 }
 
-void AgroWebServer::updateSensorData(int soil, float temp, float hum, int air, 
-                                    int airRaw, bool airGood, int tds, int tdsRaw) {
+void AgroWebServer::updateSensorData(int soil, float temp, float hum, int air,
+                                     int airRaw, bool airGood, int tds, int tdsRaw)
+{
   soilMoisture = soil;
   temperature = temp;
   humidity = hum;
@@ -62,23 +77,26 @@ void AgroWebServer::updateSensorData(int soil, float temp, float hum, int air,
   this->tdsRaw = tdsRaw;
 }
 
-void AgroWebServer::loop() {
+void AgroWebServer::loop()
+{
   server.handleClient();
 }
 
-void AgroWebServer::handleRoot() {
+void AgroWebServer::handleRoot()
+{
   String apBanner = "";
-  if (wifiManager && wifiManager->isAPMode()) {
+  if (wifiManager && wifiManager->isAPMode())
+  {
     apBanner = "<div style='background:#ff9800;padding:15px;margin:10px 0;border-radius:5px;'>"
                "<strong>⚠️ AP MODE ACTIVE</strong><br>"
                "Connect to: <strong>AgroHygra-Setup</strong> (password: agrohygra123)<br>"
                "<a href='/wifi' style='color:#fff;text-decoration:underline;'>Configure WiFi</a>"
                "</div>";
   }
-  
+
   String pumpStatus = (pumpController && pumpController->isPumpActive()) ? "ON" : "OFF";
   String pumpColor = (pumpController && pumpController->isPumpActive()) ? "#4caf50" : "#f44336";
-  
+
   String html = "<!DOCTYPE html><html><head>"
                 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<title>AgroHygra Dashboard</title>"
@@ -100,6 +118,7 @@ void AgroWebServer::handleRoot() {
                 "document.getElementById('hum').innerText=d.humidity+'%';"
                 "document.getElementById('air').innerText=d.airQuality+'%';"
                 "document.getElementById('tds').innerText=d.tds+' ppm';"
+                "if(d.npk&&d.npk.temp){document.getElementById('soilTemp').innerText=d.npk.temp.toFixed(1)+'°C';}"
                 "document.getElementById('pumpStatus').innerText=d.pump?'ON':'OFF';"
                 "document.getElementById('pumpStatus').style.background=d.pump?'#4caf50':'#f44336';"
                 "}),2000);</script>"
@@ -109,60 +128,79 @@ void AgroWebServer::handleRoot() {
                 "<h2>Sensor Readings</h2>"
                 "<div class='sensor-grid'>"
                 "<div class='sensor-card'><div class='sensor-label'>Soil Moisture</div>"
-                "<div class='sensor-value' id='soil'>" + String(soilMoisture) + "%</div></div>"
-                "<div class='sensor-card'><div class='sensor-label'>Temperature</div>"
-                "<div class='sensor-value' id='temp'>" + String(temperature, 1) + "°C</div></div>"
-                "<div class='sensor-card'><div class='sensor-label'>Humidity</div>"
-                "<div class='sensor-value' id='hum'>" + String(humidity, 1) + "%</div></div>"
-                "<div class='sensor-card'><div class='sensor-label'>Air Quality</div>"
-                "<div class='sensor-value' id='air'>" + String(airQuality) + "%</div></div>"
-                "<div class='sensor-card'><div class='sensor-label'>TDS</div>"
-                "<div class='sensor-value' id='tds'>" + String(tdsValue) + " ppm</div></div>"
-                "</div>";
-  
+                "<div class='sensor-value' id='soil'>" +
+                String(soilMoisture) + "%</div></div>"
+                                       "<div class='sensor-card'><div class='sensor-label'>Temperature</div>"
+                                       "<div class='sensor-value' id='temp'>" +
+                String(temperature, 1) + "°C</div></div>"
+                                         "<div class='sensor-card'><div class='sensor-label'>Humidity</div>"
+                                         "<div class='sensor-value' id='hum'>" +
+                String(humidity, 1) + "%</div></div>"
+                                      "<div class='sensor-card'><div class='sensor-label'>Air Quality</div>"
+                                      "<div class='sensor-value' id='air'>" +
+                String(airQuality) + "%</div></div>"
+                                     "<div class='sensor-card'><div class='sensor-label'>TDS</div>"
+                                     "<div class='sensor-value' id='tds'>" +
+                String(tdsValue) + " ppm</div></div>"
+                                   "</div>";
+
   // NPK Sensor data if available
-  if (npkSensor && npkSensor->isAvailable()) {
+  if (npkSensor && npkSensor->isAvailable())
+  {
     html += "<h2>NPK Sensor (7-in-1)</h2><div class='sensor-grid'>"
             "<div class='sensor-card'><div class='sensor-label'>Nitrogen (N)</div>"
-            "<div class='sensor-value'>" + String(npkSensor->getNitrogen(), 0) + " mg/kg</div></div>"
-            "<div class='sensor-card'><div class='sensor-label'>Phosphorus (P)</div>"
-            "<div class='sensor-value'>" + String(npkSensor->getPhosphorus(), 0) + " mg/kg</div></div>"
-            "<div class='sensor-card'><div class='sensor-label'>Potassium (K)</div>"
-            "<div class='sensor-value'>" + String(npkSensor->getPotassium(), 0) + " mg/kg</div></div>"
-            "<div class='sensor-card'><div class='sensor-label'>pH</div>"
-            "<div class='sensor-value'>" + String(npkSensor->getPH(), 1) + "</div></div>"
-            "<div class='sensor-card'><div class='sensor-label'>EC</div>"
-            "<div class='sensor-value'>" + String(npkSensor->getEC(), 2) + " mS/cm</div></div>"
-            "</div>";
+            "<div class='sensor-value'>" +
+            String(npkSensor->getNitrogen(), 0) + " mg/kg</div></div>"
+                                                  "<div class='sensor-card'><div class='sensor-label'>Phosphorus (P)</div>"
+                                                  "<div class='sensor-value'>" +
+            String(npkSensor->getPhosphorus(), 0) + " mg/kg</div></div>"
+                                                    "<div class='sensor-card'><div class='sensor-label'>Potassium (K)</div>"
+                                                    "<div class='sensor-value'>" +
+            String(npkSensor->getPotassium(), 0) + " mg/kg</div></div>"
+                                                   "<div class='sensor-card'><div class='sensor-label'>pH</div>"
+                                                   "<div class='sensor-value'>" +
+            String(npkSensor->getPH(), 1) + "</div></div>"
+                                            "<div class='sensor-card'><div class='sensor-label'>EC</div>"
+                                            "<div class='sensor-value'>" +
+            String(npkSensor->getEC(), 2) + " mS/cm</div></div>"
+                                            "<div class='sensor-card'><div class='sensor-label'>Soil Temperature</div>"
+                                            "<div class='sensor-value' id='soilTemp'>" +
+            String(npkSensor->getTemperature(), 1) + " °C</div></div>"
+                                                     "</div>";
   }
-  
+
   html += "<h2>Pump Control</h2>"
-          "<div class='status' id='pumpStatus' style='background:" + pumpColor + ";color:#fff'>" + pumpStatus + "</div>"
-          "<div style='text-align:center'>"
-          "<a href='/pump/on' class='button'>Turn Pump ON</a>"
-          "<a href='/pump/off' class='button off'>Turn Pump OFF</a>"
-          "</div>";
-  
-  if (pumpController) {
+          "<div class='status' id='pumpStatus' style='background:" +
+          pumpColor + ";color:#fff'>" + pumpStatus + "</div>"
+                                                     "<div style='text-align:center'>"
+                                                     "<a href='/pump/on' class='button'>Turn Pump ON</a>"
+                                                     "<a href='/pump/off' class='button off'>Turn Pump OFF</a>"
+                                                     "</div>";
+
+  if (pumpController)
+  {
     html += "<p style='text-align:center;color:#666'>"
-            "Watering Count: " + String(pumpController->getWateringCount()) + " | "
-            "Total Time: " + String(pumpController->getTotalWateringTime()) + "s"
-            "</p>";
+            "Watering Count: " +
+            String(pumpController->getWateringCount()) + " | "
+                                                         "Total Time: " +
+            String(pumpController->getTotalWateringTime()) + "s"
+                                                             "</p>";
   }
-  
+
   html += "<h2>Settings</h2>"
           "<div style='text-align:center'>"
           "<a href='/wifi' class='button'>WiFi Settings</a>"
           "<a href='/api' class='button'>API</a>"
           "</div>"
           "</div></body></html>";
-  
+
   server.send(200, "text/html", html);
 }
 
-void AgroWebServer::handleWiFiSetup() {
+void AgroWebServer::handleWiFiSetup()
+{
   String networks = wifiManager ? wifiManager->scanNetworks() : "";
-  
+
   String html = "<!DOCTYPE html><html><head>"
                 "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
                 "<title>WiFi Setup - AgroHygra</title>"
@@ -177,32 +215,36 @@ void AgroWebServer::handleWiFiSetup() {
                 "<h1>🌐 WiFi Configuration</h1>"
                 "<form method='POST' action='/wifi/save'>"
                 "<label>Select Network:</label>"
-                "<select name='ssid' id='ssid'>" + networks + "</select>"
-                "<label>Password:</label>"
-                "<input type='password' name='password' placeholder='WiFi password'>"
-                "<button type='submit' class='button'>Save & Connect</button>"
-                "</form>"
-                "<form method='POST' action='/wifi/clear'>"
-                "<button type='submit' class='button danger'>Clear Credentials</button>"
-                "</form>"
-                "<p style='text-align:center'><a href='/'>Back to Dashboard</a></p>"
-                "</div></body></html>";
-  
+                "<select name='ssid' id='ssid'>" +
+                networks + "</select>"
+                           "<label>Password:</label>"
+                           "<input type='password' name='password' placeholder='WiFi password'>"
+                           "<button type='submit' class='button'>Save & Connect</button>"
+                           "</form>"
+                           "<form method='POST' action='/wifi/clear'>"
+                           "<button type='submit' class='button danger'>Clear Credentials</button>"
+                           "</form>"
+                           "<p style='text-align:center'><a href='/'>Back to Dashboard</a></p>"
+                           "</div></body></html>";
+
   server.send(200, "text/html", html);
 }
 
-void AgroWebServer::handleWiFiScan() {
+void AgroWebServer::handleWiFiScan()
+{
   String networks = wifiManager ? wifiManager->scanNetworks() : "Error";
   server.send(200, "text/plain", networks);
 }
 
-void AgroWebServer::handleWiFiSave() {
-  if (server.hasArg("ssid") && server.hasArg("password") && wifiManager) {
+void AgroWebServer::handleWiFiSave()
+{
+  if (server.hasArg("ssid") && server.hasArg("password") && wifiManager)
+  {
     String ssid = server.arg("ssid");
     String password = server.arg("password");
-    
+
     wifiManager->saveCredentials(ssid, password);
-    
+
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
                   "<meta http-equiv='refresh' content='10;url=/'>"
                   "<style>body{font-family:Arial;text-align:center;padding:50px;background:#f0f0f0}"
@@ -212,20 +254,24 @@ void AgroWebServer::handleWiFiSave() {
                   "<p>Credentials saved. Device will restart...</p>"
                   "<p>Redirecting in 10 seconds...</p>"
                   "</div></body></html>";
-    
+
     server.send(200, "text/html", html);
     delay(2000);
     ESP.restart();
-  } else {
+  }
+  else
+  {
     server.send(400, "text/plain", "Missing parameters");
   }
 }
 
-void AgroWebServer::handleWiFiClear() {
-  if (wifiManager) {
+void AgroWebServer::handleWiFiClear()
+{
+  if (wifiManager)
+  {
     wifiManager->clearCredentials();
   }
-  
+
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
                 "<meta http-equiv='refresh' content='5;url=/wifi'>"
                 "<style>body{font-family:Arial;text-align:center;padding:50px;background:#f0f0f0}"
@@ -235,27 +281,32 @@ void AgroWebServer::handleWiFiClear() {
                 "<p>WiFi credentials have been deleted.</p>"
                 "<p>Redirecting to WiFi setup...</p>"
                 "</div></body></html>";
-  
+
   server.send(200, "text/html", html);
 }
 
-void AgroWebServer::handlePumpOn() {
-  if (pumpController) {
+void AgroWebServer::handlePumpOn()
+{
+  if (pumpController)
+  {
     pumpController->start();
   }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-void AgroWebServer::handlePumpOff() {
-  if (pumpController) {
+void AgroWebServer::handlePumpOff()
+{
+  if (pumpController)
+  {
     pumpController->stop();
   }
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-void AgroWebServer::handleAPI() {
+void AgroWebServer::handleAPI()
+{
   JsonDocument doc;
   doc["device"] = "AgroHygra-ESP32";
   doc["timestamp"] = millis() / 1000;
@@ -270,9 +321,10 @@ void AgroWebServer::handleAPI() {
   doc["pump"] = pumpController ? pumpController->isPumpActive() : false;
   doc["wateringCount"] = pumpController ? pumpController->getWateringCount() : 0;
   doc["totalWateringTime"] = pumpController ? pumpController->getTotalWateringTime() : 0;
-  
+
   // NPK data if available
-  if (npkSensor && npkSensor->isAvailable()) {
+  if (npkSensor && npkSensor->isAvailable())
+  {
     doc["npk"]["n"] = npkSensor->getNitrogen();
     doc["npk"]["p"] = npkSensor->getPhosphorus();
     doc["npk"]["k"] = npkSensor->getPotassium();
@@ -281,7 +333,7 @@ void AgroWebServer::handleAPI() {
     doc["npk"]["temp"] = npkSensor->getTemperature();
     doc["npk"]["moisture"] = npkSensor->getHumidity();
   }
-  
+
   String json;
   serializeJson(doc, json);
   server.send(200, "application/json", json);
