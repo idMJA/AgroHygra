@@ -227,7 +227,7 @@ void setup()
   }
   else
   {
-    lcdDisplay.showMessage("WiFi Connected", WiFi.localIP().toString());
+    lcdDisplay.showMessage("WiFi Connected", WiFi.localIP().toString().c_str());
   }
 
   delay(2000);
@@ -276,7 +276,18 @@ void loop()
                                airQuality, airQualityRaw, airQualityGood,
                                tdsValue, tdsRaw);
 
-    // Update LCD display
+    // Update LCD display with safe C-strings
+    static char ipBuffer[16];
+    if (wifiManager.isAPMode())
+    {
+      strncpy(ipBuffer, "192.168.4.1", sizeof(ipBuffer) - 1);
+    }
+    else
+    {
+      snprintf(ipBuffer, sizeof(ipBuffer), "%s", WiFi.localIP().toString().c_str());
+    }
+    ipBuffer[sizeof(ipBuffer) - 1] = '\0';
+
     lcdDisplay.setData(soilMoisture, temperature, humidity,
                        airQuality, airQualityGood, tdsValue,
                        pumpController.isPumpActive(),
@@ -284,8 +295,8 @@ void loop()
                        pumpController.getWateringCount(),
                        mqttManager.isConnected(),
                        wifiManager.isAPMode(),
-                       wifiManager.getSSID(),
-                       wifiManager.isAPMode() ? "192.168.4.1" : WiFi.localIP().toString());
+                       wifiManager.getSSID().c_str(),
+                       ipBuffer);
   }
 
   // Update LCD (handles its own timing)
@@ -301,6 +312,7 @@ void loop()
   // Update status LED
   updateStatusLED();
 
-  // Small delay to prevent watchdog timeout
+  // Yield to prevent watchdog timeout
+  yield();
   delay(10);
 }
