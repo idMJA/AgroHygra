@@ -219,18 +219,29 @@ void setup()
   wifiManager.begin();
   wifiManager.loadCredentials();
 
-  if (!wifiManager.connect())
+  // Wait for WiFi connection before MQTT
+  unsigned long wifiStartTime = millis();
+  while (!wifiManager.isConnected() && millis() - wifiStartTime < 20000) {
+    if (!wifiManager.connect()) {
+      Serial.println("⏳ Retrying WiFi connection...");
+      delay(2000);
+    }
+  }
+
+  if (wifiManager.isConnected())
+  {
+    Serial.println("✅ WiFi connection successful!");
+    lcdDisplay.showMessage("WiFi Connected", WiFi.localIP().toString().c_str());
+    delay(1000); // Allow DHCP to fully stabilize
+  }
+  else
   {
     Serial.println("⚠️  WiFi connection failed, starting AP mode...");
     wifiManager.startAPMode();
     lcdDisplay.showMessage("AP Mode", "192.168.4.1");
   }
-  else
-  {
-    lcdDisplay.showMessage("WiFi Connected", WiFi.localIP().toString().c_str());
-  }
 
-  delay(2000);
+  delay(1000);
 
   // Initialize MQTT
   Serial.println("\n📨 Initializing MQTT...");

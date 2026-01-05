@@ -49,13 +49,25 @@ bool WiFiManager::connect() {
   }
 
   Serial.println("📡 Connecting to WiFi: " + savedSSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(); // Ensure clean state
   WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
 
+  unsigned long startTime = millis();
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  
+  // Wait for connection with improved timeout handling (15 seconds max)
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
     delay(500);
     Serial.print(".");
     attempts++;
+    
+    // Check for permanent failures
+    if (WiFi.status() == WL_CONNECT_FAILED || WiFi.status() == WL_NO_SSID_AVAIL) {
+      Serial.println();
+      Serial.println("❌ WiFi connection failed (invalid SSID or credentials)!");
+      return false;
+    }
   }
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -66,9 +78,10 @@ bool WiFiManager::connect() {
     Serial.print("   Signal: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
+    delay(500); // Allow time for IP configuration to stabilize
     return true;
   } else {
-    Serial.println("\n❌ WiFi connection failed");
+    Serial.println("\n❌ WiFi connection timeout");
     return false;
   }
 }

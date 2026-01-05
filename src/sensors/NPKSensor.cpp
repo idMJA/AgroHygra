@@ -159,25 +159,25 @@ bool NPKSensor::readSensor()
 {
   // Read all 7 registers one by one
   uint16_t moisture_raw = readRegister(MOISTURE_REGISTER);
-  delay(100);
+  delay(150);
 
   uint16_t temperature_raw = readRegister(TEMPERATURE_REGISTER);
-  delay(100);
+  delay(150);
 
   uint16_t conductivity_raw = readRegister(CONDUCTIVITY_REGISTER);
-  delay(100);
+  delay(150);
 
   uint16_t ph_raw = readRegister(PH_REGISTER);
-  delay(100);
+  delay(150);
 
   uint16_t nitrogen_raw = readRegister(NITROGEN_REGISTER);
-  delay(100);
+  delay(150);
 
   uint16_t phosphorus_raw = readRegister(PHOSPHORUS_REGISTER);
-  delay(100);
+  delay(150);
 
   uint16_t potassium_raw = readRegister(POTASSIUM_REGISTER);
-  delay(100);
+  delay(150);
 
   // Count valid readings
   int validReadings = 0;
